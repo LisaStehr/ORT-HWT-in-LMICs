@@ -109,20 +109,7 @@ write.csv(data, "demo_dataset.csv", row.names = FALSE)
 
 ---
 
-### Instructions for Use
-
-#### How to Run on Your Data
-1. Ensure your dataset is in a format readable by R (e.g., `.csv`).
-2. Modify the `demo_function` code if needed for specific requirements.
-3. Load your dataset into R:
-   ```R
-   my_data <- read.csv("your_dataset.csv")
-   ```
-4. Run the `demo_function` on your dataset:
-   ```R
-   result <- demo_function(my_data)
-   print(result)
-   ```
+### Instructions for Use can be found in the respective Rmd/do files
 
 ---
 
