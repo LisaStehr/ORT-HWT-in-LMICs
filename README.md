@@ -60,10 +60,10 @@ Use concentration index.do for the concentration index (STATA)
    ```
 2. Load the demo dataset:
    ```R
-data <- data.frame(
-  id = 1:10,
-  value = c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
-)
+   data <- data.frame(
+   id = 1:10,
+   value = c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+   )
    ```
 3. Run the function on the dataset:
    ```R
