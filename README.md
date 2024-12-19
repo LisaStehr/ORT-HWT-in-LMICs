@@ -8,7 +8,9 @@ The analysis is done with two datasets (ORT, HWT) for five outcomes, three from 
 Correspondence and materials requests should be addressed to Lisa Stehr
 
 Use ORS analysis_Revision 1_public.Rmd for the ORS dataset (R)
+
 Use HWT analysis_Revision 1_public.Rmd for the HWT dataset (R)
+
 Use concentration index.do for the concentration index (STATA)
 
 ### Example Code
