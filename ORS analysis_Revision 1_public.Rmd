@@ -1,0 +1,2351 @@
+---
+title: "ORS analysis-Revision_1"
+author: "Lisa Stehr"
+date: "2/13/2024"
+output: html_document
+---
+
+### This is the analysis code for ORS variables. It includes three outcomes: ORT, appropriate feeding, and ORT+appropriate feeding. All analysis were done for two time periods: 2000-2009 and 2010-2021
+
+```{r}
+
+library(survey)
+options(survey.lonely.psu="adjust")
+library(ggplot2)
+library(data.table)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(openxlsx)
+
+setwd("~")
+
+```
+
+
+```{r, load in dataset and get sample sizes}
+
+knowbehav_subset <- read_dta("~/knowbehav_subset_diar.dta")
+    
+# check sample size per region    
+africa <- filter(knowbehav_subset, region=='Africa') %>% distinct(country) #40
+america <- filter(knowbehav_subset, region=='The Americas') %>% distinct(country) #20
+asia <- filter(knowbehav_subset, region=='South-East Asia') %>% distinct(country) #8
+medit <- filter(knowbehav_subset, region=='Eastern Mediteranean') %>% distinct(country) #10
+europe <- filter(knowbehav_subset, region=='Europe') %>% distinct(country) #17
+pacific <- filter(knowbehav_subset, region=='Western Pacific') %>% distinct(country) #17
+
+# check sample size per income group (leave out the distinct to geht sample size for individual n)
+low <- filter(knowbehav_subset, income_group=='Low-income economies') %>% distinct(country) #23 now 24
+low_middle <- filter(knowbehav_subset, income_group=='Lower-middle-income economies') %>% distinct(country) #39 now 40
+upper_middle <- filter(knowbehav_subset, income_group=='Upper-middle-income economies') %>% distinct(country) #34 now 35
+
+# prepare diarrhea subset for survey design to calculate prevalence
+knowbehav_subset <- knowbehav_subset %>%
+    mutate(perc_diarr_drink = perc_diarr_drink/100) %>% filter(perc_diarr_drink <=1) %>% 
+    mutate(perc_appr_feed = perc_appr_feed/100) %>% filter(perc_appr_feed <=1) %>% 
+    mutate(perc_diar_treat_all = perc_diar_treat_all/100) %>% filter(perc_diar_treat_all <=1) %>% 
+    mutate(p_wt = ifelse(is.na(p_wt)==T, 1, p_wt),
+           stratum = ifelse(is.na(stratum)==T, 1, stratum))
+
+# get missing values
+missings <- select(knowbehav_subset, perc_diarr_drink, perc_appr_feed, educat, wealth_quintile, urban)
+na_percentages <- sapply(missings, function(x) mean(is.na(x)) * 100)
+
+
+```
+
+## split analysis into two time periods: 2000-2009 and 2010-2021 
+
+```{r rescale weights}
+
+#scale the weights by the population size in LMICs/the region in question relative to the population size of the country and the survey's sample size
+
+# calculate sample size
+ sum_weights <- knowbehav_subset %>%
+  group_by(country, year) %>%
+  #summarise(survey_n = n())
+  summarise(total_weight = sum(p_wt))
+
+# Join the row counts back to the original data frame
+knowbehav_subset <- knowbehav_subset %>%
+ # left_join(survey_n) %>%
+  left_join(sum_weights)
+
+# get population estimates for countries and regions, from https://population.un.org/wpp/Download/Standard/CSV/
+Population_UNestimates <- read.csv("~/Downloads/WPP2022_TotalPopulationBySex.csv", header=T)
+Population_UNestimates <- Population_UNestimates %>%
+  rename(year = Time,
+         country = Location,
+         Iso = ISO3_code
+         ) %>%
+  select(year, country, Iso, PopTotal) 
+
+earlypop <- filter(Population_UNestimates, year==2005)
+latepop <- filter(Population_UNestimates, year==2016)
+
+# merge into two datasets
+earlytime <- knowbehav_subset %>%
+  filter(year > 1999 & year < 2010) %>%
+  left_join(earlypop, by='Iso') %>%
+  select(-year.y, -country.y) %>%
+  rename(country=country.x,
+         year=year.x)
+
+latertime <- knowbehav_subset %>%
+  filter(year > 2009) %>%
+  left_join(latepop, by='Iso') %>%
+  select(-year.y, -country.y) %>%
+  rename(country=country.x,
+         year=year.x)
+
+# add values where merging didn't work
+earlytime <- earlytime %>%
+  mutate(PopTotal = ifelse(country=='Guinea-Bissau', 1379.713,
+                           ifelse(country=='Pakistan', 174372.098,PopTotal)))
+
+latertime <- latertime %>%
+  mutate(PopTotal = ifelse(country=='Guinea-Bissau', 1834.552,
+                           ifelse(country=='Pakistan', 213524.8,PopTotal)))
+
+#attain final weights
+latertime <- latertime %>%
+  group_by(country, year) %>%
+  mutate(scaled_weights = p_wt * PopTotal/total_weight)
+
+earlytime <- earlytime %>%
+  group_by(country, year) %>%
+  mutate(scaled_weights = p_wt * PopTotal/total_weight) 
+  
+```
+
+### 2010-2021
+
+```{r prepare and create survey design}
+
+# limit to country-year samples with at least 50 individuals and countries with at least two surveys within timeframe
+sample <- latertime %>% 
+    group_by(country, year) %>%
+    summarise(total=n()) %>%
+    filter(total >50)  #%>%
+    #filter(n()>1)
+  sum(sample$total)
+  
+latertime_ors <- sample %>% left_join(latertime)
+
+# get numbers of countries and n in sample
+nlevels(as.factor(latertime_ors$country)) #89
+
+# check sample size per region for flowchart  
+africa <- filter(latertime_ors, region=='Africa') #39
+america <- filter(latertime_ors, region=='The Americas') #16
+asia <- filter(latertime_ors, region=='South-East Asia') #8
+medit <- filter(latertime_ors, region=='Eastern Mediteranean') #9
+europe <- filter(latertime_ors, region=='Europe') #12
+pacific <- filter(latertime_ors, region=='Western Pacific') #5
+
+# check sample size per income group 
+low <- filter(latertime_ors, income_group=='Low-income economies') 
+low_middle <- filter(latertime_ors, income_group=='Lower-middle-income economies')
+upper_middle <- filter(latertime_ors, income_group=='Upper-middle-income economies')
+
+# create survey design
+design.latertime_ors <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_ors, nest = T) #this is the general design that is then used for each outcome
+
+```
+
+```{r ORS mean prevalence; by region, by income group}
+
+prev.latertime_ors <- svyby(~perc_diarr_drink, by=~region, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_ors <- prev.latertime_ors %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_ors, file = "prev.latertime_ors.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.latertime_ors.incomegr <- svyby(~perc_diarr_drink, by=~income_group, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_ors.incomegr <- prev.latertime_ors.incomegr %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_ors.incomegr, file = "prev.latertime_ors.incomegr.xlsx", borders = "columns")
+
+
+```
+
+```{r appropriate feeding; by region, by income group}
+
+prev.latertime_feed <- svyby(~perc_appr_feed, by=~region, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_feed <- prev.latertime_feed %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_feed, file = "prev.latertime_feed.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.latertime_feed.incomegr <- svyby(~perc_appr_feed, by=~income_group, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_feed.incomegr <- prev.latertime_feed.incomegr %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_feed.incomegr, file = "prev.latertime_feed.incomegr.xlsx", borders = "columns")
+
+```
+
+```{r ORT and feed; by region, by income group}
+
+prev.latertime_ortfeed <- svyby(~perc_diar_treat_all, by=~region, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_ortfeed <- prev.latertime_ortfeed %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_ortfeed, file = "prev.latertime_ortfeed.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.latertime_ortfeed.incomegr <- svyby(~perc_diar_treat_all, by=~income_group, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime_ortfeed.incomegr <- prev.latertime_ortfeed.incomegr %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_ortfeed.incomegr, file = "prev.latertime_ortfeed.incomegr.xlsx", borders = "columns")
+
+```
+
+```{r global prevalence}
+
+# ORS
+svymean(~perc_diarr_drink, design.latertime_ors, deff=TRUE)  
+confint(svymean(~perc_diarr_drink, design.latertime_ors, level = 0.95))
+
+# feed
+svymean(~perc_appr_feed, design.latertime_ors, deff=TRUE)  
+confint(svymean(~perc_appr_feed, design.latertime_ors, level = 0.95))
+
+# ORS + feed
+svymean(~perc_diar_treat_all, design.latertime_ors, deff=TRUE)  
+confint(svymean(~perc_diar_treat_all, design.latertime_ors, level = 0.95))
+
+
+```
+
+```{r country level prevalence for each outcome}
+
+### ORS prevalence 
+prev.latertime.country_ors <- svyby(~perc_diarr_drink, by=~country + year, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime.country_ors <- prev.latertime.country_ors %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime.country_ors, file = "prev.latertime.country_ors.xlsx", borders = "columns")
+
+### FEEDING 
+prev.latertime.country_feed <- svyby(~perc_appr_feed, by=~country + year, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime.country_feed <- prev.latertime.country_feed %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime.country_feed, file = "prev.latertime.country_feed.xlsx", borders = "columns")
+
+### ORT AND FEED
+prev.latertime.country_ortfeed <- svyby(~perc_diar_treat_all, by=~country + year, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.latertime.country_ortfeed <- prev.latertime.country_ortfeed %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year,w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime.country_ortfeed, file = "prev.latertime.country_ortfeed.xlsx", borders = "columns")
+
+```
+
+```{r Figure 3: world map}
+
+# Get world map data
+world_map <- map_data("world")
+
+# set plot features
+plain <- theme(
+  axis.text = element_blank(),
+  axis.line = element_blank(),
+  axis.ticks = element_blank(),
+  panel.border = element_blank(),
+  panel.grid = element_blank(),
+  axis.title = element_blank(),
+  panel.background = element_rect(fill = "white"),
+  plot.title = element_text(hjust = 0.5)
+)
+
+# get ORT prevalence data
+ort.data <- read_excel("~/Figure 3 country level/2010-2021/prev.latertime.country_ors.xlsx")
+
+# only keep most recent prevalence
+ort.data <- ort.data %>%
+  select(country, year, w_mean) %>%
+  group_by(country) %>%
+  slice_max(year, with_ties = FALSE) %>%
+  rename(region = country)
+
+# rename some countries to merge with world map
+ort.data <- ort.data%>%
+  mutate(region = ifelse(region == 'Congo Dem.Rep.', 'Democratic Republic of the Congo',
+                        ifelse(region == "Cote d'Ivoire", 'Ivory Coast',
+                               ifelse(region == "Dom.Rep.", 'Dominican Republic',
+                                      ifelse(region == "Eswatini", 'Swaziland',
+                                             ifelse(region == "Kyrgyz.Rep.", 'Kyrgyzstan',
+                                                    ifelse(region == 'Sao Tome', 'Sao Tome and Principe',
+                        ifelse(region == "Lao People's Democratic Republic", 'Laos',
+                               ifelse(region == "State of Palestine", 'Palestine',
+                                      ifelse(region == "Trinidad and Tobago", 'Trinidad', 
+                                             ifelse(region == "Congo", 'Republic of Congo',region)))))))))))
+
+
+ort.data <- world_map%>%
+  left_join(ort.data, by = "region")
+
+# create map
+map.ort <- ggplot(data = ort.data) +
+  geom_polygon(aes(x = long, y = lat, group = group, fill = w_mean), color = "white") +
+  scale_fill_gradient(low = "yellow", high = "red", na.value = "grey50") +
+  coord_fixed(1.3) +
+  scale_fill_distiller(palette ="RdBu", direction = -1) +
+  labs(title = "ORT Prevalence",
+       fill = "Prevalence (%)") +
+  theme(legend.position = "bottom") +
+  plain
+
+ggsave("map.ort.png", height = 6, width = 6)
+ggsave("map.ort.pdf", height = 6, width = 6)
+
+
+```
+
+```{r Figure 4: concentration index}
+
+# I calculated concentracion indexes in STATA because conindex function is easier to use there
+global.ci.fig <- read_excel("~/Figure 4 concentration index/Tables/global.fig.xlsx") #the values were generated in the STATA file and manually wrangled in excel to fit the format for plotting
+
+global.ci.fig$years <- global.ci.fig$years %>% factor(c("2010-2021", "2000-2009"))
+global.ci.fig$years <- factor(global.ci.fig$years, levels = rev(levels(global.ci.fig$years)))
+
+global.ci.fig$indicator <- global.ci.fig$indicator %>% factor(c("HWT", "Adequate HWT", "ORT", "Appropriate feeding", "ORT + appropriate feeding"))
+
+global.ci.fig.manuscr <- global.ci.fig %>% 
+  ggplot(aes(x = ci, y = level, color = years)) +
+  geom_point(size = 3, shape = 18, position = position_dodge(width = 0.5)) +
+  # Add a segment (line) connecting the point to 0
+  geom_segment(
+    aes(x = ci, xend = 0, y = level, yend = level),
+    position = position_dodge(width = 0.5),
+    size = 1, alpha = 0.7
+  ) +
+  labs(
+    title = "Concentration index",
+    x = "",
+    y = "%",
+    fill = ""
+  ) +
+  facet_wrap(~ indicator) +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 25, color = "black"),
+    axis.title = element_text(size = 25, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 25)),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.y = element_text(margin = margin(r = 25)),
+    # Increase the size of facet panel titles
+    strip.text.x = element_text(size = 17, face = "bold", margin = margin(r = 45)),  
+    title = element_text(size = 25, face = "bold"),
+    legend.text = element_text(size = 25),
+    strip.background = element_blank(),
+    legend.position="bottom",
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_color_manual(values = c("#FDBB84", "#990000")) +
+  guides(color = guide_legend(reverse = TRUE))
+
+ggsave("global.ci.fig.manuscr.png", height = 10, width = 15)
+ggsave("global.ci.fig.manuscr.pdf", height = 10, width = 15)
+
+
+```
+
+```{r average annual rate of change (AARC); 2010-2021}
+#using the combined country prevalence calculated 
+
+### ORS
+prev.perc_drinking_diar_drink_treat <- read_excel("~/Figure 3 country level/prev.country_ors.xlsx") #this is the country prevalence combined for both time periods, which I did manually in excel
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>% 
+  filter(year >2009)
+
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/Know-behav paper/aarc_final.prev.perc_drinking_diar_drink_treat.csv")
+
+### FEEDING
+prev.perc_appr_feed <- read_excel("~/Figure 3 country level/prev.country_feed.xlsx")
+prev.perc_appr_feed <- prev.perc_appr_feed %>% 
+  filter(year >2009)
+
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.prev.perc_appr_feed.csv")
+
+### ORS + appropriate feeding
+prev.perc_diar_treat_all <- read_excel("~/Figure 3 country level/prev.country_ortfeed.xlsx")
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>% 
+  filter(year >2009)
+
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.prev.perc_diar_treat_all.csv")
+
+
+
+```
+
+#appendix
+```{r eFigure 5-10: country level figure}
+
+### ORS
+prev_ors <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_drinking_diar_drink_treat.csv")
+prev_ors <- prev_ors %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_ors <- prev_ors %>%
+  left_join(regions)
+
+prev_ors <- prev_ors %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_ors <- prev_ors %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_ors <- prev_ors %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup() %>%
+  mutate(country_year = paste(country, year, sep = " "))
+
+prev_ors$year <- factor(prev_ors$year, levels = unique(prev_ors$year))
+
+### ALL COUNTRIES
+prev_ors.fig.late.all  <- prev_ors %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("ORT prevalence, 2010-2021"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_ors.fig.late.all.png", height = 35, width = 49)
+
+### FEED
+prev_feed <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_appr_feed.csv")
+prev_feed <- prev_feed %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_feed <- prev_feed %>%
+  left_join(regions)
+
+prev_feed <- prev_feed %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_feed <- prev_feed %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_feed <- prev_feed %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup() 
+
+prev_feed$year <- factor(prev_feed$year, levels = unique(prev_feed$year))
+
+### ALL COUNTRIES
+prev_feed.fig.late.all  <- prev_feed %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("Appropriate feeding prevalence, 2010-2021"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_feed.fig.late.all.png", height = 35, width = 49)
+
+### ors.feed + FEED
+prev_ors.feed <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_diar_treat_all.csv")#
+prev_ors.feed <- prev_ors.feed %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_ors.feed <- prev_ors.feed %>%
+  left_join(regions)
+
+prev_ors.feed <- prev_ors.feed %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_ors.feed <- prev_ors.feed %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_ors.feed <- prev_ors.feed %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_ors.feed$year <- factor(prev_ors.feed$year, levels = unique(prev_ors.feed$year))
+
+### ALL COUNTRIES
+prev_ors.feed.all  <- prev_ors.feed %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("Appropriate feeding + ORT prevalence, 2010-2021"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_ors.feed.all.png", height = 35, width = 49)
+
+
+```
+
+```{r eTable 16-21: AARC and country prevalence tables}
+
+### ORS 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_diar_treat_all.csv")
+ort_country_prev <- read_excel("~/Figure 3 country level/prev.country_ors.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit() 
+  
+# append both tables
+ort_country_prev.aarc.late <- ort_country_prev %>%
+  filter(year > 2009)%>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(ort_country_prev.aarc.late, file = "ort_country_prev.aarc.late.xlsx", borders = "columns")
+
+### FEEDING 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_appr_feed.csv")
+feed_country_prev <- read_excel("~/Figure 3 country level/prev.country_feed.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+feed_country_prev.aarc.late <- feed_country_prev %>%
+  filter(year > 2009)%>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(feed_country_prev.aarc.late, file = "feed_country_prev.aarc.late.xlsx", borders = "columns")
+
+### FEEDING 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_drinking_diar_drink_treat.csv")
+ortfeed_country_prev <- read_excel("~/Figure 3 country level/prev.country_ortfeed.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+ortfeed_country_prev.aarc.late <- ortfeed_country_prev %>%
+  filter(year > 2009) %>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(ortfeed_country_prev.aarc.late, file = "ortfeed_country_prev.aarc.late.xlsx", borders = "columns")
+
+```
+
+```{r eTables 22-51: concentration index tables}
+
+#concentrated prevalence for each country and year, by wealth, education and residence. Later add concentration index from STATA output for combined eTables 22-51
+
+### ORS
+# wealth
+prev.later_ors.wealth <- svyby(~perc_diarr_drink, by=~country:year:wealth_quintile, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_ors.wealth <- prev.later_ors.wealth %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.later_ors.wealth <- reshape(prev.later_ors.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide") %>%
+  arrange(country, desc(year)) 
+
+write.xlsx(prev.later_ors.wealth, file = "prev.later_ors.wealth.xlsx", borders = "columns")
+
+# education
+prev.later_ors.edu <- svyby(~perc_diarr_drink, by=~country:year:educat, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_ors.edu <- prev.later_ors.edu %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.later_ors.edu <- reshape(prev.later_ors.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide") %>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_ors.edu, file = "prev.later_ors.edu.xlsx", borders = "columns")
+
+# urban
+prev.later_ors.urban <- svyby(~perc_diarr_drink, by=~country:year:urban, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_ors.urban <- prev.later_ors.urban %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.later_ors.urban <- reshape(prev.later_ors.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide") %>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_ors.urban, file = "prev.later_ors.urban.xlsx", borders = "columns")
+
+### FEEDING
+# wealth
+prev.later_feed.wealth <- svyby(~perc_appr_feed, by=~country:year:wealth_quintile, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_feed.wealth <- prev.later_feed.wealth %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_feed.wealth <- reshape(prev.later_feed.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_feed.wealth, file = "prev.later_feed.wealth.xlsx", borders = "columns")
+
+# education
+prev.later_feed.edu <- svyby(~perc_appr_feed, by=~country:year:educat, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_feed.edu <- prev.later_feed.edu %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_feed.edu <- reshape(prev.later_feed.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_feed.edu, file = "prev.later_feed.edu.xlsx", borders = "columns")
+
+# urban
+prev.later_feed.urban <- svyby(~perc_appr_feed, by=~country:year:urban, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_feed.urban <- prev.later_feed.urban %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_feed.urban <- reshape(prev.later_feed.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_feed.urban, file = "prev.later_feed.urban.xlsx", borders = "columns")
+
+### ORT + FEEDING
+# wealth
+prev.later_orsfeed.wealth <- svyby(~perc_diar_treat_all, by=~country:year:wealth_quintile, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_orsfeed.wealth <- prev.later_orsfeed.wealth %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_orsfeed.wealth <- reshape(prev.later_orsfeed.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_orsfeed.wealth, file = "prev.later_orsfeed.wealth.xlsx", borders = "columns")
+
+# education
+prev.later_orsfeed.edu <- svyby(~perc_diar_treat_all, by=~country:year:educat, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_orsfeed.edu <- prev.later_orsfeed.edu %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_orsfeed.edu <- reshape(prev.later_orsfeed.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_orsfeed.edu, file = "prev.later_orsfeed.edu.xlsx", borders = "columns")
+
+# urban
+prev.later_orsfeed.urban <- svyby(~perc_diar_treat_all, by=~country:year:urban, design=design.latertime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_orsfeed.urban <- prev.later_orsfeed.urban %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_orsfeed.urban <- reshape(prev.later_orsfeed.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_orsfeed.urban, file = "prev.later_orsfeed.urban.xlsx", borders = "columns")
+
+### merge concentration index prevalence tables with ci tables
+
+# ORS | education
+prev_later_ors_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_ors.edu.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.late.edu.xlsx")
+
+later_ors_ci_edu <- prev_later_ors_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(later_ors_ci_edu, file = "later_ors_ci_edu.xlsx", borders = "columns")
+
+# ORS | wealth
+prev_later_ors_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_ors.wealth.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.late.wealth.xlsx")
+
+later_ors_ci_wealth <- prev_later_ors_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(later_ors_ci_wealth, file = "later_ors_ci_wealth.xlsx", borders = "columns")
+
+# ORS | urban
+prev_later_ors_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_ors.urban.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.late.urban.xlsx")
+
+later_ors_ci_urban <- prev_later_ors_urban %>% 
+  select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(later_ors_ci_urban, file = "later_ors_ci_urban.xlsx", borders = "columns")
+
+# feeding | education
+prev_later_feed_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_feed.edu.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.late.edu.xlsx")
+
+later_feed_ci_edu <- prev_later_feed_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(later_feed_ci_edu, file = "later_feed_ci_edu.xlsx", borders = "columns")
+
+# feed | wealth
+prev_later_feed_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_feed.wealth.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.late.wealth.xlsx")
+
+later_feed_ci_wealth <- prev_later_feed_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(later_feed_ci_wealth, file = "later_feed_ci_wealth.xlsx", borders = "columns")
+
+# feed | urban
+prev_later_feed_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_feed.urban.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.late.urban.xlsx")
+
+later_feed_ci_urban <- prev_later_feed_urban %>% 
+    select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(later_feed_ci_urban, file = "later_feed_ci_urban.xlsx", borders = "columns")
+
+# ORS + feeding | education
+prev_later_orsfeed_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_orsfeed.edu.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.late.edu.xlsx")
+
+later_orsfeed_ci_edu <- prev_later_orsfeed_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(later_orsfeed_ci_edu, file = "later_orsfeed_ci_edu.xlsx", borders = "columns")
+
+# orsfeed | wealth
+prev_later_orsfeed_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_orsfeed.wealth.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.late.wealth.xlsx")
+
+later_orsfeed_ci_wealth <- prev_later_orsfeed_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(later_orsfeed_ci_wealth, file = "later_orsfeed_ci_wealth.xlsx", borders = "columns")
+
+# orsfeed | urban
+prev_later_orsfeed_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.later_orsfeed.urban.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.late.urban.xlsx")
+
+later_orsfeed_ci_urban <- prev_later_orsfeed_urban %>% 
+    select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(later_orsfeed_ci_urban, file = "later_orsfeed_ci_urban.xlsx", borders = "columns")
+
+### add early period
+
+# ORS | education
+prev_early_ors_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_ors.edu.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.early.edu.xlsx")
+
+early_ors_ci_edu <- prev_early_ors_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(early_ors_ci_edu, file = "early_ors_ci_edu.xlsx", borders = "columns")
+
+# ORS | wealth
+prev_early_ors_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_ors.wealth.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.early.wealth.xlsx")
+
+early_ors_ci_wealth <- prev_early_ors_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(early_ors_ci_wealth, file = "early_ors_ci_wealth.xlsx", borders = "columns")
+
+# ORS | urban
+prev_early_ors_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_ors.urban.xlsx")
+concentration_index_ORS <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.ORS.early.urban.xlsx")
+
+early_ors_ci_urban <- prev_early_ors_urban %>% 
+      select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_ORS)
+
+write.xlsx(early_ors_ci_urban, file = "early_ors_ci_urban.xlsx", borders = "columns")
+
+# feeding | education
+prev_early_feed_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_feed.edu.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.early.edu.xlsx")
+
+early_feed_ci_edu <- prev_early_feed_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(early_feed_ci_edu, file = "early_feed_ci_edu.xlsx", borders = "columns")
+
+# feed | wealth
+prev_early_feed_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_feed.wealth.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.early.wealth.xlsx")
+
+early_feed_ci_wealth <- prev_early_feed_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(early_feed_ci_wealth, file = "early_feed_ci_wealth.xlsx", borders = "columns")
+
+# feed | urban
+prev_early_feed_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_feed.urban.xlsx")
+concentration_index_feed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.feed.early.urban.xlsx")
+
+early_feed_ci_urban <- prev_early_feed_urban %>% 
+        select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_feed)
+
+write.xlsx(early_feed_ci_urban, file = "early_feed_ci_urban.xlsx", borders = "columns")
+
+# ORS + feeding | education
+prev_early_orsfeed_edu <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_orsfeed.edu.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.early.edu.xlsx")
+
+early_orsfeed_ci_edu <- prev_early_orsfeed_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(early_orsfeed_ci_edu, file = "early_orsfeed_ci_edu.xlsx", borders = "columns")
+
+# orsfeed | wealth
+prev_early_orsfeed_wealth <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_orsfeed.wealth.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.early.wealth.xlsx")
+
+early_orsfeed_ci_wealth <- prev_early_orsfeed_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(early_orsfeed_ci_wealth, file = "early_orsfeed_ci_wealth.xlsx", borders = "columns")
+
+# orsfeed | urban
+prev_early_orsfeed_urban <- read_excel("~/Figure 4 concentration index/Tables/Prevalence by tables/prev.early_orsfeed.urban.xlsx")
+concentration_index_orsfeed <- read_excel("~/Figure 4 concentration index/Tables/concentration.index.orsfeed.early.urban.xlsx")
+
+early_orsfeed_ci_urban <- prev_early_orsfeed_urban %>% 
+          select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_orsfeed)
+
+write.xlsx(early_orsfeed_ci_urban, file = "early_orsfeed_ci_urban.xlsx", borders = "columns")
+
+```
+
+### 2000-2009
+
+```{r prepare and create survey design}
+
+# limit to countrie-year samples with at least 50 individuals and countries with at least two surveys within timeframe
+sample <- earlytime %>% 
+    group_by(country, year) %>%
+    summarise(total=n()) %>%
+    filter(total >50)  
+  sum(sample$total)
+  
+earlytime_ors <- sample %>% left_join(earlytime)
+
+# get numbers of countries and n in sample
+nlevels(as.factor(earlytime_ors$country))
+
+# check sample size per region for flowchart  
+africa <- filter(earlytime_ors, region=='Africa') #35
+america <- filter(earlytime_ors, region=='The Americas') #8
+asia <- filter(earlytime_ors, region=='South-East Asia') #5
+medit <- filter(earlytime_ors, region=='Eastern Mediteranean') #4
+europe <- filter(earlytime_ors, region=='Europe') #4
+pacific <- filter(earlytime_ors, region=='Western Pacific') #3
+
+# check sample size per income group 
+low <- filter(earlytime_ors, income_group=='Low-income economies') 
+low_middle <- filter(earlytime_ors, income_group=='Lower-middle-income economies')
+upper_middle <- filter(earlytime_ors, income_group=='Upper-middle-income economies') 
+
+# create survey design
+design.earlytime_ors <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_ors, nest = T) #this is the general design that is then used for each outcome
+
+```
+
+```{r ORS mean prevalence; by region, by income group}
+
+# REGION
+prev.earlytime_ors <- svyby(~perc_diarr_drink, by=~region, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_ors <- prev.earlytime_ors %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_ors, file = "prev.earlytime_ors.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.earlytime_ors.incomegr <- svyby(~perc_diarr_drink, by=~income_group, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_ors.incomegr <- prev.earlytime_ors.incomegr %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_ors.incomegr, file = "prev.earlytime_ors.incomegr.xlsx", borders = "columns")
+
+
+```
+
+```{r appropriate feeding; by region, by income group}
+
+# REGION
+prev.earlytime_feed <- svyby(~perc_appr_feed, by=~region, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_feed <- prev.earlytime_feed %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_feed, file = "prev.earlytime_feed.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.earlytime_feed.incomegr <- svyby(~perc_appr_feed, by=~income_group, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_feed.incomegr <- prev.earlytime_feed.incomegr %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_feed.incomegr, file = "prev.earlytime_feed.incomegr.xlsx", borders = "columns")
+
+```
+
+```{r ORT and feed; by region, by income group}
+
+#REGION
+prev.earlytime_ortfeed <- svyby(~perc_diar_treat_all, by=~region, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_ortfeed <- prev.earlytime_ortfeed %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_ortfeed, file = "prev.earlytime_ortfeed.xlsx", borders = "columns")
+
+### INCOME GROUP
+prev.earlytime_ortfeed.incomegr <- svyby(~perc_diar_treat_all, by=~income_group, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime_ortfeed.incomegr <- prev.earlytime_ortfeed.incomegr %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_ortfeed.incomegr, file = "prev.earlytime_ortfeed.incomegr.xlsx", borders = "columns")
+
+```
+
+```{r global prevalence}
+
+# ORS
+svymean(~perc_diarr_drink, design.earlytime_ors, deff=TRUE)  
+confint(svymean(~perc_diarr_drink, design.earlytime_ors, level = 0.95))
+
+# feed
+svymean(~perc_appr_feed, design.earlytime_ors, deff=TRUE)  
+confint(svymean(~perc_appr_feed, design.earlytime_ors, level = 0.95))
+
+# ORS + feed
+svymean(~perc_diar_treat_all, design.earlytime_ors, deff=TRUE)  
+confint(svymean(~perc_diar_treat_all, design.earlytime_ors, level = 0.95))
+
+```
+
+```{r Figure 2: Global, regional and income group prevalence for both time periods}
+
+# ORS
+prev_figure2 <- read_excel("prev_figure2.ors.xlsx") #prepare this figure in excel, easier than in R directly
+
+# create and order factor levels
+prev_figure2$level <- prev_figure2$level %>% factor(c("Global", "Africa", "Eastern Mediterranean", "Europe", "South-East Asia", "The Americas", "Western Pacific", "Low-income", "Lower-middle-income", "Upper-middle-income"))
+prev_figure2$level <- factor(prev_figure2$level, levels = rev(levels(prev_figure2$level)))
+
+prev_figure2$years <- prev_figure2$years %>% factor(c("2010-2021", "2000-2009"))
+prev_figure2$years <- factor(prev_figure2$years, levels = rev(levels(prev_figure2$years)))
+
+# plot                                                    
+ors.fig2 <- prev_figure2 %>% 
+  ggplot(aes(x = level, y = mean, fill = years)) +
+  geom_bar(stat = "identity", alpha = 0.9, position = position_dodge(width = 0.5), width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.5), show.legend = FALSE) +
+  labs(
+    title = paste0("ORT treatment prevalence"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  theme_bw()+
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 35)),
+    axis.title.y = element_text(margin = margin(r = 35)),
+    strip.text.x = element_text(size = 35, face = "bold"),
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 35),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_fill_manual(values = c("#FDBB84", "#990000")) +
+  coord_flip() +
+  guides(fill = guide_legend(reverse = TRUE))
+
+print(ors.fig2)
+ #coord_fixed(5/100) 
+
+ggsave("ors.fig2.png", height = 12, width = 25) 
+ggsave("ors.fig2.pdf", height = 12, width = 25)
+          
+### FEEDING
+prev_figure2 <- read_excel("prev_figure2.feed.xlsx")
+
+# create and order factor levels
+prev_figure2$level <- prev_figure2$level %>% factor(c("Global", "Africa", "Eastern Mediterranean", "Europe", "South-East Asia", "The Americas", "Western Pacific", "Low-income", "Lower-middle-income", "Upper-middle-income"))
+prev_figure2$level <- factor(prev_figure2$level, levels = rev(levels(prev_figure2$level)))
+
+prev_figure2$years <- prev_figure2$years %>% factor(c("2010-2021", "2000-2009"))
+prev_figure2$years <- factor(prev_figure2$years, levels = rev(levels(prev_figure2$years)))
+
+ # plot                                                    
+feed.fig2 <- prev_figure2 %>% 
+  ggplot(aes(x = level, y = mean, fill = years)) +
+  geom_bar(stat = "identity", alpha = 0.9, position = position_dodge(width = 0.5), width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.5), show.legend = FALSE) +
+  labs(
+    title = paste0("Appropriate feeding treatment prevalence"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  theme_bw()+
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 35)),
+    axis.title.y = element_text(margin = margin(r = 35)),
+    strip.text.x = element_text(size = 35, face = "bold"),
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 35),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_fill_manual(values = c("#FDBB84", "#990000")) +
+  coord_flip() +
+  guides(fill = guide_legend(reverse = TRUE))
+
+print(feed.fig2)
+ #coord_fixed(5/100) 
+
+ggsave("feed.fig2.png", height = 12, width = 25)
+ggsave("feed.fig2.pdf", height = 12, width = 25)
+
+### ORS AND FEEDING
+prev_figure2 <- read_excel("prev_figure2.orsfeed.xlsx")
+
+# create and order factor levels
+prev_figure2$level <- prev_figure2$level %>% factor(c("Global", "Africa", "Eastern Mediterranean", "Europe", "South-East Asia", "The Americas", "Western Pacific", "Low-income", "Lower-middle-income", "Upper-middle-income"))
+prev_figure2$level <- factor(prev_figure2$level, levels = rev(levels(prev_figure2$level)))
+
+prev_figure2$years <- prev_figure2$years %>% factor(c("2010-2021", "2000-2009"))
+prev_figure2$years <- factor(prev_figure2$years, levels = rev(levels(prev_figure2$years)))
+
+# plot 
+orsandfeed.fig2 <- prev_figure2 %>% 
+  ggplot(aes(x = level, y = mean, fill = years)) +
+  geom_bar(stat = "identity", alpha = 0.9, position = position_dodge(width = 0.5), width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.5), show.legend = FALSE) +
+  labs(
+    title = paste0("ORT + appropriate feeding treatment prevalence"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  theme_bw()+
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 35)),
+    axis.title.y = element_text(margin = margin(r = 35)),
+    strip.text.x = element_text(size = 35, face = "bold"),
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 35),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_fill_manual(values = c("#FDBB84", "#990000")) +
+  coord_flip() +
+  guides(fill = guide_legend(reverse = TRUE))
+
+print(orsandfeed.fig2)
+ #coord_fixed(5/100) 
+
+ggsave("orsandfeed.fig2.png", height = 12, width = 25) 
+ggsave("orsandfeed.fig2.pdf", height = 12, width = 25)
+
+```
+
+```{r country level prevalence for each outcome}
+
+### ORS prevalence 
+prev.earlytime.country_ors <- svyby(~perc_diarr_drink, by=~country + year, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime.country_ors <- prev.earlytime.country_ors %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime.country_ors, file = "prev.earlytime.country_ors.xlsx", borders = "columns")
+
+### FEEDING 
+prev.earlytime.country_feed <- svyby(~perc_appr_feed, by=~country + year, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime.country_feed <- prev.earlytime.country_feed %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime.country_feed, file = "prev.earlytime.country_feed.xlsx", borders = "columns")
+
+### ORT AND FEED
+prev.earlytime.country_ortfeed <- svyby(~perc_diar_treat_all, by=~country + year, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.earlytime.country_ortfeed <- prev.earlytime.country_ortfeed %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year,w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime.country_ortfeed, file = "prev.earlytime.country_ortfeed.xlsx", borders = "columns")
+
+```
+
+```{r average annual rate of change (AARC); 2000-2009}
+
+### ORS
+prev.perc_drinking_diar_drink_treat <- read_excel("~/Figure 3 country level/prev.country_ors.xlsx")
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>% 
+ filter(year > 1999 & year < 2010)
+
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev.perc_drinking_diar_drink_treat <- prev.perc_drinking_diar_drink_treat %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_drinking_diar_drink_treat %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/Know-behav paper/aarc_final.prev.perc_drinking_diar_drink_treat.early.csv")
+
+### FEEDING
+prev.perc_appr_feed <- read_excel("~/Figure 3 country level/prev.country_feed.xlsx")
+prev.perc_appr_feed <- prev.perc_appr_feed %>% 
+filter(year > 1999 & year < 2010)
+
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev.perc_appr_feed <- prev.perc_appr_feed %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_appr_feed %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/Know-behav paper/aarc_final.prev.perc_appr_feed.early.csv")
+
+### ORS + appropriate feeding
+prev.perc_diar_treat_all <- read_excel("~/Figure 3 country level/prev.country_ortfeed.xlsx")
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>% 
+filter(year > 1999 & year < 2010)
+
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev.perc_diar_treat_all <- prev.perc_diar_treat_all %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev.perc_diar_treat_all %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/Know-behav paper/aarc_final.prev.perc_diar_treat_all.early.csv")
+
+```
+
+#appendix
+```{r eTables 22-51: concentration index tables}
+
+#concentrated prevalence for each country and year, by wealth, education and residence. Later add concentration index from STATA output for combined eTables 22-51
+
+### ORS
+# wealth
+prev.early_ors.wealth <- svyby(~perc_diarr_drink, by=~country:year:wealth_quintile, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_ors.wealth <- prev.early_ors.wealth %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.early_ors.wealth <- reshape(prev.early_ors.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide") %>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.early_ors.wealth, file = "prev.early_ors.wealth.xlsx", borders = "columns")
+
+# education
+prev.early_ors.edu <- svyby(~perc_diarr_drink, by=~country:year:educat, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_ors.edu <- prev.early_ors.edu %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.early_ors.edu <- reshape(prev.early_ors.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.early_ors.edu, file = "prev.early_ors.edu.xlsx", borders = "columns")
+
+# urban
+prev.early_ors.urban <- svyby(~perc_diarr_drink, by=~country:year:urban, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_ors.urban <- prev.early_ors.urban %>% 
+  mutate( w_mean = perc_diarr_drink*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+prev.early_ors.urban <- reshape(prev.early_ors.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.early_ors.urban, file = "prev.early_ors.urban.xlsx", borders = "columns")
+
+### FEEDING
+# wealth
+prev.early_feed.wealth <- svyby(~perc_appr_feed, by=~country:year:wealth_quintile, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_feed.wealth <- prev.early_feed.wealth %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_feed.wealth <- reshape(prev.early_feed.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_feed.wealth, file = "prev.early_feed.wealth.xlsx", borders = "columns")
+
+# education
+prev.early_feed.edu <- svyby(~perc_appr_feed, by=~country:year:educat, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_feed.edu <- prev.early_feed.edu %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_feed.edu <- reshape(prev.early_feed.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_feed.edu, file = "prev.early_feed.edu.xlsx", borders = "columns")
+
+# urban
+prev.early_feed.urban <- svyby(~perc_appr_feed, by=~country:year:urban, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_feed.urban <- prev.early_feed.urban %>% 
+  mutate( w_mean = perc_appr_feed*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_feed.urban <- reshape(prev.early_feed.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_feed.urban, file = "prev.early_feed.urban.xlsx", borders = "columns")
+
+### ORT + FEEDING
+# wealth
+prev.early_orsfeed.wealth <- svyby(~perc_diar_treat_all, by=~country:year:wealth_quintile, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_orsfeed.wealth <- prev.early_orsfeed.wealth %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_orsfeed.wealth <- reshape(prev.early_orsfeed.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_orsfeed.wealth, file = "prev.early_orsfeed.wealth.xlsx", borders = "columns")
+
+# education
+prev.early_orsfeed.edu <- svyby(~perc_diar_treat_all, by=~country:year:educat, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_orsfeed.edu <- prev.early_orsfeed.edu %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_orsfeed.edu <- reshape(prev.early_orsfeed.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_orsfeed.edu, file = "prev.early_orsfeed.edu.xlsx", borders = "columns")
+
+# urban
+prev.early_orsfeed.urban <- svyby(~perc_diar_treat_all, by=~country:year:urban, design=design.earlytime_ors, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_orsfeed.urban <- prev.early_orsfeed.urban %>% 
+  mutate( w_mean = perc_diar_treat_all*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_orsfeed.urban <- reshape(prev.early_orsfeed.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_orsfeed.urban, file = "prev.early_orsfeed.urban.xlsx", borders = "columns")
+
+
+
+```
+
+```{r eFigure 5-10: country level figure}
+
+### ORS
+prev_ors <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_drinking_diar_drink_treat.early.csv")
+prev_ors <- prev_ors %>% select(-X)
+regions <-read.csv("~/Know-behav paper/regions.csv")
+
+prev_ors <- prev_ors %>%
+  left_join(regions)
+
+prev_ors <- prev_ors %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_ors <- prev_ors %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_ors <- prev_ors %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup() %>%
+  mutate(country_year = paste(country, year, sep = " "))
+
+prev_ors$year <- factor(prev_ors$year, levels = unique(prev_ors$year))
+
+### ALL COUNTRIES
+prev_ors.fig.early.all  <- prev_ors %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("ORT prevalence, 2000-2009"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_ors.fig.early.all.png", height = 35, width = 49)
+
+### FEED
+prev_feed <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_appr_feed.early.csv")
+prev_feed <- prev_feed %>% select(-X)
+regions <-read.csv("~/Know-behav paper/regions.csv")
+
+prev_feed <- prev_feed %>%
+  left_join(regions)
+
+prev_feed <- prev_feed %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_feed <- prev_feed %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_feed <- prev_feed %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup() 
+
+prev_feed$year <- factor(prev_feed$year, levels = unique(prev_feed$year))
+
+### ALL COUNTRIES
+prev_feed.early.all  <- prev_feed %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("Appropriate feeding prevalence, 2000-2009"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_feed.early.all.png", height = 35, width = 49)
+
+### ors.feed + FEED
+prev_ors.feed <- read.csv("~/Figure 3 country level/aarc_final.prev.perc_diar_treat_all.early.csv")#
+prev_ors.feed <- prev_ors.feed %>% select(-X)
+regions <-read.csv("~/Know-behav paper/regions.csv")
+
+prev_ors.feed <- prev_ors.feed %>%
+  left_join(regions)
+
+prev_ors.feed <- prev_ors.feed %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+prev_ors.feed <- prev_ors.feed %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_ors.feed <- prev_ors.feed %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_ors.feed$year <- factor(prev_ors.feed$year, levels = unique(prev_ors.feed$year))
+
+### ALL COUNTRIES
+prev_ors.feed.early.all  <- prev_ors.feed %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("Appropriate feeding + ORT prevalence, 2000-2009"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_ors.feed.early.all.png", height = 35, width = 49)
+
+```
+
+```{r eTable 16-21: AARC and country prevalence tables}
+
+### ORS 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_diar_treat_all.early.csv")
+ort_country_prev <- read_excel("~/Figure 3 country level/prev.country_ors.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+ort_country_prev.aarc.early <- ort_country_prev %>%
+  filter(year > 1999 & year < 2010) %>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(ort_country_prev.aarc.early, file = "ort_country_prev.aarc.early.xlsx", borders = "columns")
+
+### FEEDING 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_appr_feed.early.csv")
+feed_country_prev <- read_excel("~/Figure 3 country level/prev.country_feed.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+feed_country_prev.aarc.early <- feed_country_prev %>%
+  filter(year > 1999 & year < 2010) %>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(feed_country_prev.aarc.early, file = "feed_country_prev.aarc.early.xlsx", borders = "columns")
+
+### FEEDING 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/Figure 3 country level/aarc_final.prev.perc_diar_treat_all.early.csv")
+ortfeed_country_prev <- read_excel("~/Figure 3 country level/prev.country_ortfeed.xlsx")
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+ortfeed_country_prev.aarc.early <- ortfeed_country_prev %>%
+  filter(year > 1999 & year < 2010) %>%
+  arrange(country, desc(year)) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Estimate_CI", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(ortfeed_country_prev.aarc.early, file = "ortfeed_country_prev.aarc.early.xlsx", borders = "columns")
+
+
+```
+
+
