@@ -1,0 +1,2216 @@
+---
+title: "HWT analysis-Revision_1"
+author: "Lisa Stehr"
+date: "2/15/2024"
+output: html_document
+---
+### This is the analysis code for HWT variables. It includes two outcomes: Household water treatment (water_treat_any) and household water treatment with appropriate methods (water_treat_appr). All analysis were done for two time periods: 2000-2009 and 2010-2021
+
+```{r load packages and set working directory}
+
+library(survey)
+options(survey.lonely.psu="adjust")
+library(ggplot2)
+library(data.table)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(openxlsx)
+
+setwd("~")
+
+```
+
+
+```{r load in dataset and get sample sizes}
+
+knowbehav_subset <- read_csv("~/subset_hwtdata.csv")
+
+# check sample size per region    
+africa <- filter(knowbehav_subset, region=='Africa') %>% distinct(country) #40
+america <- filter(knowbehav_subset, region=='The Americas') %>% distinct(country) #20
+asia <- filter(knowbehav_subset, region=='South-East Asia') %>% distinct(country) #8
+medit <- filter(knowbehav_subset, region=='Eastern Mediteranean') %>% distinct(country) #10
+europe <- filter(knowbehav_subset, region=='Europe') %>% distinct(country) #17
+pacific <- filter(knowbehav_subset, region=='Western Pacific') %>% distinct(country) #17
+
+# check sample size per income group (leave out the distinct to get sample size for individual n)
+low <- filter(knowbehav_subset, income_group=='Low-income economies') %>% distinct(country) #23 now 24
+low_middle <- filter(knowbehav_subset, income_group=='Lower-middle-income economies') %>% distinct(country) #39 now 40
+upper_middle <- filter(knowbehav_subset, income_group=='Upper-middle-income economies') %>% distinct(country) #34 now 35
+
+# prepare diarrhea subset for survey design to calculate prevalence
+knowbehav_subset <- knowbehav_subset %>%
+    mutate(p_wt = ifelse(is.na(p_wt)==T, 1, p_wt),
+           stratum = ifelse(is.na(stratum)==T, 1, stratum))
+
+## get missing values
+missings <- select(knowbehav_subset, water_treat_appr, water_treat_any, educat, wealth_quintile, urban)
+na_percentages <- sapply(missings, function(x) mean(is.na(x)) * 100)
+
+```
+
+## split analysis into two time periods: 2000-2009 and 2010-2021 
+
+```{r rescale weights and split time periods}
+
+#scale the weights by the population size in LMICs/the region in question relative to the population size of the country and the survey's sample size
+
+# calculate sample size
+ sum_weights <- knowbehav_subset %>%
+  group_by(country, year) %>%
+  summarise(total_weight = sum(p_wt))
+
+# Join the row counts back to the original data frame
+knowbehav_subset <- knowbehav_subset %>%
+  left_join(sum_weights)
+
+# get population estimates for countries and regions, from https://population.un.org/wpp/Download/Standard/CSV/
+Population_UNestimates <- read.csv("~/WPP2022_TotalPopulationBySex.csv", header=T)
+Population_UNestimates <- Population_UNestimates %>%
+  rename(year = Time,
+         country = Location,
+         Iso = ISO3_code
+         ) %>%
+  select(year, country, Iso, PopTotal) 
+
+earlypop <- filter(Population_UNestimates, year==2005)
+latepop <- filter(Population_UNestimates, year==2016)
+
+# merge into two datasets
+earlytime <- knowbehav_subset %>%
+  filter(year > 1999 & year < 2010) %>%
+  left_join(earlypop, by='Iso') %>%
+  select(-year.y, -country.y) %>%
+  rename(country=country.x,
+         year=year.x)
+
+latertime <- knowbehav_subset %>%
+  filter(year > 2009) %>%
+  left_join(latepop, by='Iso') %>%
+  select(-year.y, -country.y) %>%
+  rename(country=country.x,
+         year=year.x)
+
+# add values where merging didn't work
+earlytime <- earlytime %>%
+  mutate(PopTotal = ifelse(country=='Guinea-Bissau', 1379.713,
+                           ifelse(country=='Pakistan', 174372.098,PopTotal)))
+
+latertime <- latertime %>%
+  mutate(PopTotal = ifelse(country=='Guinea-Bissau', 1834.552,
+                           ifelse(country=='Pakistan', 213524.8,PopTotal)))
+
+#attain final weights
+latertime <- latertime %>%
+  group_by(country, year) %>%
+  mutate(scaled_weights = p_wt * PopTotal/total_weight)
+
+earlytime <- earlytime %>%
+  group_by(country, year) %>%
+  mutate(scaled_weights = p_wt * PopTotal/total_weight) 
+
+
+```
+
+### 2010-2021
+
+```{r prepare and create survey design}
+
+# limit to country-year samples with at least 50 individuals and countries with at least two surveys within timeframe
+sample <- latertime %>% 
+    group_by(country, year) %>%
+    summarise(total=n()) %>%
+    filter(total >50)  #%>%
+    #filter(n()>1)
+  sum(sample$total) #4039862
+  
+latertime_hwt <- sample %>% 
+  left_join(latertime) %>%
+  select(-X, -X.1, -total_weight, -PopTotal)
+
+###limit to countries that have survey in both waves
+countries.hwt.late <- latertime_hwt %>%
+  distinct(country) 
+
+# check sample size per region for flowchart  
+africa <- filter(latertime_hwt, region=='Africa') #40
+america <- filter(latertime_hwt, region=='The Americas') #15
+asia <- filter(latertime_hwt, region=='South-East Asia') #8
+medit <- filter(latertime_hwt, region=='Eastern Mediteranean') #9
+europe <- filter(latertime_hwt, region=='Europe') #14
+pacific <- filter(latertime_hwt, region=='Western Pacific') #5
+
+# check sample size per income group 
+low <- filter(latertime_hwt, income_group=='Low-income economies') 
+low_middle <- filter(latertime_hwt, income_group=='Lower-middle-income economies')
+upper_middle <- filter(latertime_hwt, income_group=='Upper-middle-income economies') 
+
+latertime_hwt <- latertime_hwt %>%
+  mutate(country_year = paste(country, year, sep = "-"))
+
+```
+
+# dataset is too large, therefore we have to calculate prevalence for each region and income group separately and then append
+
+### 2010-2021
+
+```{r HWT any, by region; by income group}
+
+# Africa
+latertime_hwt_africa <- filter(latertime_hwt, region=="Africa")
+design.latertime_hwt_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_africa, nest = T)
+prev.latertime_hwt_africa <- svyby(~water_treat_any, by=~region, design=design.latertime_hwt_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+latertime_hwt_medit <- filter(latertime_hwt, region=="Eastern Mediteranean")
+design.latertime_hwt_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_medit, nest = T)
+prev.latertime_hwt_medit <- svyby(~water_treat_any, by=~region, design=design.latertime_hwt_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+latertime_hwt_europe <- filter(latertime_hwt, region=="Europe" | region=="Western Pacific")
+design.latertime_hwt_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_europe, nest = T)
+prev.latertime_hwt_europe <- svyby(~water_treat_any, by=~region, design=design.latertime_hwt_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+latertime_hwt_america <- filter(latertime_hwt, region=="The Americas")
+design.latertime_hwt_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_america, nest = T) #scaled_weights
+prev.latertime_hwt_america <- svyby(~water_treat_any, by=~region, design=design.latertime_hwt_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+latertime_hwt_asia <- filter(latertime_hwt, region=="South-East Asia")
+design.latertime_hwt_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_asia, nest = T)
+prev.latertime_hwt_asia <- svyby(~water_treat_any, by=~region, design=design.latertime_hwt_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwt <- bind_rows(prev.latertime_hwt_africa, prev.latertime_hwt_medit, prev.latertime_hwt_europe, prev.latertime_hwt_america, prev.latertime_hwt_asia)
+
+# bring into decent format and save as excel
+prev.latertime_hwt <- prev.latertime_hwt %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwt, file = "prev.latertime_hwt.xlsx", borders = "columns")
+
+### INCOME GROUP
+
+# Upper Middle
+latertime_hwt.income_upperm <- filter(latertime_hwt, income_group=="Upper-middle-income economies")
+design.latertime_hwt.income_upperm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt.income_upperm, nest = T)
+prev.latertime_hwt.income_upperm <- svyby(~water_treat_any, by=~income_group, design=design.latertime_hwt.income_upperm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low Middle
+latertime_hwt.income_lowm <- filter(latertime_hwt, income_group=="Lower-middle-income economies")
+design.latertime_hwt.income_lowm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt.income_lowm, nest = T)
+prev.latertime_hwt.income_lowm <- svyby(~water_treat_any, by=~income_group, design=design.latertime_hwt.income_lowm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low
+latertime_hwt.income_low <- filter(latertime_hwt, income_group=="Low-income economies")
+design.latertime_hwt.income_low <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt.income_low, nest = T)
+prev.latertime_hwt.income_low <- svyby(~water_treat_any, by=~income_group, design=design.latertime_hwt.income_low, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwt.income <- bind_rows(prev.latertime_hwt.income_upperm, prev.latertime_hwt.income_lowm, prev.latertime_hwt.income_low)
+
+# bring into decent format and save as excel
+prev.latertime_hwt.income <- prev.latertime_hwt.income %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwt.income, file = "prev.latertime_hwt.income.xlsx", borders = "columns")
+
+```
+
+```{r HWT adequate, by region; by income group}
+
+# Africa
+latertime_hwtappr_africa <- filter(latertime_hwt, region=="Africa")
+design.latertime_hwtappr_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_africa, nest = T)
+prev.latertime_hwtappr_africa <- svyby(~water_treat_appr, by=~region, design=design.latertime_hwtappr_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+latertime_hwtappr_medit <- filter(latertime_hwt, region=="Eastern Mediteranean")
+design.latertime_hwtappr_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_medit, nest = T)
+prev.latertime_hwtappr_medit <- svyby(~water_treat_appr, by=~region, design=design.latertime_hwtappr_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+latertime_hwtappr_europe <- filter(latertime_hwt, region=="Europe" | region=="Western Pacific")
+design.latertime_hwtappr_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_europe, nest = T)
+prev.latertime_hwtappr_europe <- svyby(~water_treat_appr, by=~region, design=design.latertime_hwtappr_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+latertime_hwtappr_america <- filter(latertime_hwt, region=="The Americas")
+design.latertime_hwtappr_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_america, nest = T)
+prev.latertime_hwtappr_america <- svyby(~water_treat_appr, by=~region, design=design.latertime_hwtappr_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+latertime_hwtappr_asia <- filter(latertime_hwt, region=="South-East Asia")
+design.latertime_hwtappr_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_asia, nest = T)
+prev.latertime_hwtappr_asia <- svyby(~water_treat_appr, by=~region, design=design.latertime_hwtappr_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwtappr <- bind_rows(prev.latertime_hwtappr_africa, prev.latertime_hwtappr_medit, prev.latertime_hwtappr_europe, prev.latertime_hwtappr_america, prev.latertime_hwtappr_asia)
+
+# bring into decent format and save as excel
+prev.latertime_hwtappr <- prev.latertime_hwtappr %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwtappr, file = "prev.latertime_hwtappr.xlsx", borders = "columns")
+
+### INCOME GROUP
+# Upper Middle
+latertime_hwtappr.income_upperm <- filter(latertime_hwt, income_group=="Upper-middle-income economies")
+design.latertime_hwtappr.income_upperm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr.income_upperm, nest = T)
+prev.latertime_hwtappr.income_upperm <- svyby(~water_treat_appr, by=~income_group, design=design.latertime_hwtappr.income_upperm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low Middle
+latertime_hwtappr.income_lowm <- filter(latertime_hwt, income_group=="Lower-middle-income economies")
+design.latertime_hwtappr.income_lowm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr.income_lowm, nest = T)
+prev.latertime_hwtappr.income_lowm <- svyby(~water_treat_appr, by=~income_group, design=design.latertime_hwtappr.income_lowm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low
+latertime_hwtappr.income_low <- filter(latertime_hwt, income_group=="Low-income economies")
+design.latertime_hwtappr.income_low <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr.income_low, nest = T)
+prev.latertime_hwtappr.income_low <- svyby(~water_treat_appr, by=~income_group, design=design.latertime_hwtappr.income_low, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwtappr.income <- bind_rows(prev.latertime_hwtappr.income_upperm, prev.latertime_hwtappr.income_lowm, prev.latertime_hwtappr.income_low)
+
+# bring into decent format and save as excel
+prev.latertime_hwtappr.income <- prev.latertime_hwtappr.income %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwtappr.income, file = "prev.latertime_hwtappr.income.xlsx", borders = "columns")
+
+```
+
+```{r global prevalence}
+
+#load in global survey design
+design.latertime_hwt.global <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt, nest = T) 
+
+# HWT
+svymean(~water_treat_any, design.latertime_hwt.global, deff=TRUE)  
+confint(svymean(~water_treat_any, design.latertime_hwt.global, level = 0.95))
+
+# appropriate HWT
+svymean(~water_treat_appr, design.latertime_hwt.global, deff=TRUE)  
+confint(svymean(~water_treat_appr, design.latertime_hwt.global, level = 0.95))
+
+
+```
+
+```{r country level prevalence for each outcome}
+
+#again, given that the dataset is too large, we need to do this by region and then append
+### HWT
+
+# Africa
+latertime_hwt_africa <- filter(latertime_hwt, region=="Africa")
+design.latertime_hwt_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_africa, nest = T)
+prev.latertime_hwt_africa <- svyby(~water_treat_any, by=~country + year, design=design.latertime_hwt_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+latertime_hwt_medit <- filter(latertime_hwt, region=="Eastern Mediteranean")
+design.latertime_hwt_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_medit, nest = T)
+prev.latertime_hwt_medit <- svyby(~water_treat_any, by=~country + year, design=design.latertime_hwt_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+latertime_hwt_europe <- filter(latertime_hwt, region=="Europe" | region=="Western Pacific")
+design.latertime_hwt_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_europe, nest = T)
+prev.latertime_hwt_europe <- svyby(~water_treat_any, by=~country + year, design=design.latertime_hwt_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+latertime_hwt_america <- filter(latertime_hwt, region=="The Americas")
+design.latertime_hwt_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_america, nest = T)
+prev.latertime_hwt_america <- svyby(~water_treat_any, by=~country + year, design=design.latertime_hwt_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+latertime_hwt_asia <- filter(latertime_hwt, region=="South-East Asia")
+design.latertime_hwt_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwt_asia, nest = T)
+prev.latertime_hwt_asia <- svyby(~water_treat_any, by=~country + year, design=design.latertime_hwt_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwt <- bind_rows(prev.latertime_hwt_africa, prev.latertime_hwt_medit, prev.latertime_hwt_europe, prev.latertime_hwt_america, prev.latertime_hwt_asia)
+
+# bring into decent format and save as excel
+prev.latertime_hwt <- prev.latertime_hwt %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwt, file = "prev.latertime.country_hwt.xlsx", borders = "columns")
+
+### HWT APPROPRIATE
+
+# Africa
+latertime_hwtappr_africa <- filter(latertime_hwt, region=="Africa")
+design.latertime_hwtappr_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_africa, nest = T)
+prev.latertime_hwtappr_africa <- svyby(~water_treat_appr, by=~country + year, design=design.latertime_hwtappr_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+latertime_hwtappr_medit <- filter(latertime_hwt, region=="Eastern Mediteranean")
+design.latertime_hwtappr_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_medit, nest = T)
+prev.latertime_hwtappr_medit <- svyby(~water_treat_appr, by=~country + year, design=design.latertime_hwtappr_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+latertime_hwtappr_europe <- filter(latertime_hwt, region=="Europe" | region=="Western Pacific")
+design.latertime_hwtappr_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_europe, nest = T)
+prev.latertime_hwtappr_europe <- svyby(~water_treat_appr, by=~country + year, design=design.latertime_hwtappr_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+latertime_hwtappr_america <- filter(latertime_hwt, region=="The Americas")
+design.latertime_hwtappr_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_america, nest = T)
+prev.latertime_hwtappr_america <- svyby(~water_treat_appr, by=~country + year, design=design.latertime_hwtappr_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+latertime_hwtappr_asia <- filter(latertime_hwt, region=="South-East Asia")
+design.latertime_hwtappr_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=latertime_hwtappr_asia, nest = T)
+prev.latertime_hwtappr_asia <- svyby(~water_treat_appr, by=~country + year, design=design.latertime_hwtappr_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.latertime_hwtappr <- bind_rows(prev.latertime_hwtappr_africa, prev.latertime_hwtappr_medit, prev.latertime_hwtappr_europe, prev.latertime_hwtappr_america, prev.latertime_hwtappr_asia)
+
+# bring into decent format and save as excel
+prev.latertime_hwtappr <- prev.latertime_hwtappr %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.latertime_hwtappr, file = "prev.latertime.country_hwtappr.xlsx", borders = "columns")
+
+```
+
+```{r average annual rate of change (AARC), 2010-2021}
+
+### HWT any
+prev_water_treat_any <- read_excel("~/prev.country_hwt.xlsx")#I compiled this file manually in excel to include prevalences from both time periods. File can be found in folder "Excel files HWT"
+prev_water_treat_any <- prev_water_treat_any %>% 
+  filter(year >2009)
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev_water_treat_any <- prev_water_treat_any %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev_water_treat_any %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev_water_treat_any %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev_water_treat_any %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.hwt.csv")
+
+### HWT APPROPRIATE
+prev_water_treat_appr <- read_excel("~/Figure 3 country level/prev.country_hwtappr.xlsx") #I compiled this file manually in excel to include prevalences from both time periods. File can be found in folder "Excel files HWT"
+prev_water_treat_appr <- prev_water_treat_appr %>% 
+  filter(year >2009)
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.hwtappr.csv")
+
+```
+
+```{r Figure 3: world map}
+
+# Get world map data
+world_map <- map_data("world")
+
+# set plot features
+plain <- theme(
+  axis.text = element_blank(),
+  axis.line = element_blank(),
+  axis.ticks = element_blank(),
+  panel.border = element_blank(),
+  panel.grid = element_blank(),
+  axis.title = element_blank(),
+  panel.background = element_rect(fill = "white"),
+  plot.title = element_text(hjust = 0.5)
+)
+
+# get hwt prevalence data
+hwt.data <- read_excel("~/prev.country_hwt.xlsx") #I compiled this file manually in excel to include prevalences from both time periods. File can be found in folder "Excel files HWT"
+
+# only keep most recent prevalence
+hwt.data <- hwt.data %>%
+  select(country, year, w_mean) %>%
+  group_by(country) %>%
+  slice_max(year, with_ties = FALSE) %>%
+  rename(region = country)
+
+# rename some countries to merge with world map
+hwt.data <- hwt.data%>%
+  mutate(region = ifelse(region == 'Congo Dem.Rep.', 'Democratic Republic of the Congo',
+                         ifelse(region == "Cote d'Ivoire", 'Ivory Coast',
+                                ifelse(region == "Dom.Rep.", 'Dominican Republic',
+                                       ifelse(region == "Eswatini", 'Swaziland',
+                                              ifelse(region == "Kyrgyz.Rep.", 'Kyrgyzstan',
+                                                     ifelse(region == 'Sao Tome', 'Sao Tome and Principe',
+                                                            ifelse(region == "Lao People's Democratic Republic", 'Laos',
+                                                                   ifelse(region == "State of Palestine", 'Palestine',
+                                                                          ifelse(region == "Trinidad and Tobago", 'Trinidad', 
+                                                                                 ifelse(region == "Congo", 'Republic of Congo',region)))))))))))
+
+
+hwt.data <- world_map%>%
+  left_join(hwt.data, by = "region")
+
+# create map
+map.hwt <- ggplot(data = hwt.data) +
+  geom_polygon(aes(x = long, y = lat, group = group, fill = w_mean), color = "white") +
+  scale_fill_gradient(low = "yellow", high = "red", na.value = "grey50") +
+  coord_fixed(1.3) +
+  scale_fill_distiller(palette ="RdBu", direction = -1) +
+  labs(title = "HWT Prevalence",
+       fill = "Prevalence (%)") +
+  theme(legend.position = "bottom") +
+  plain
+
+ggsave("map.hwt.png", height = 6, width = 6)
+ggsave("map.hwt.pdf", height = 6, width = 6)
+
+
+```
+
+#appendix
+```{r eFigure 1-4: country level figure}
+
+prev_water_treat_any <- read.csv("~/aarc_final.hwt.csv")#
+prev_water_treat_any <- prev_water_treat_any %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  left_join(regions)
+
+prev_water_treat_any <- prev_water_treat_any %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_water_treat_any$year <- factor(prev_water_treat_any$year, levels = unique(prev_water_treat_any$year))
+
+### ALL COUNTRIES
+prev_water_treat_any.fig.late.low  <- prev_water_treat_any %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("HWT prevalence, 2010-2021"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_water_treat_any.fig.late.country.png", height = 35, width = 49)
+
+### HWTW appropriate
+prev_water_treat_appr <- read.csv("~/aarc_final.hwtappr.csv")#
+prev_water_treat_appr <- prev_water_treat_appr %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  left_join(regions)
+
+prev_water_treat_appr <- prev_water_treat_appr %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_water_treat_appr$year <- factor(prev_water_treat_appr$year, levels = unique(prev_water_treat_appr$year))
+
+### ALL COUNTRIES
+prev_water_treat_appr.fig.late.all  <- prev_water_treat_appr %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("HWT appropriate method prevalence, 2010-2021"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 5) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_water_treat_appr.fig.late.country.png", height = 35, width = 49)
+
+```
+
+```{r eTable 12-15: AARC and country prevalence tables}
+
+### HWT 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/aarc_final.hwt.csv")
+hwt_country_prev <- read_excel("~/hwt.country.prev.xlsx") #these were compiled manually in excel to fit the required format and available in the folder "Excel files HWT" 
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+hwt_country_prev.aarc.late <- hwt_country_prev %>%
+  filter(year > 2009) %>%
+  arrange(country, desc(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Prevalence (95% CI)", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(hwt_country_prev.aarc.late, file = "hwt_country_prev.aarc.late.xlsx", borders = "columns")
+
+### HWT appr.
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/aarc_final.hwtappr.csv")
+hwt_country_prev <- read_excel("~/hwt.appr.country.prev.xlsx")#these were compiled manually in excel to fit the required format and available in the folder "Excel files HWT" 
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+hwt.appr_country_prev.aarc.late <- hwt_country_prev %>%
+  filter(year > 2009) %>%
+  arrange(country, desc(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Prevalence (95% CI)", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(hwt.appr_country_prev.aarc.late, file = "hwt.appr_country_prev.aarc.late.xlsx", borders = "columns")
+
+```
+
+```{r eTables 22-51: concentration index tables}
+
+#again, we need to split dataset for Africa and Asia and all other regions, because otherwise it's too large to load
+#concentrated prevalence for each country and year, by wealth, education and residence. Later add concentration index from STATA output for combined eTables 22-51
+
+### HWT any
+africa <- latertime_hwt %>% filter(region=='Africa')
+rest <- latertime_hwt %>% #
+  filter(region!='Africa') %>%
+  filter(region!='South-East Asia')
+
+design.latertime_hwt.africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=africa, nest = T)
+
+# wealth | Africa
+prev.later_hwt.wealth.africa <- svyby(~water_treat_any, by=~country:year:wealth_quintile, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.wealth.africa <- prev.later_hwt.wealth.africa %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.wealth.africa <- reshape(prev.later_hwt.wealth.africa, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.wealth.africa, file = "prev.later_hwt.wealth.africa.xlsx", borders = "columns")
+
+# wealth | Asia 
+design.latertime_hwt.asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=asia, nest = T)
+prev.later_hwt.wealth.asia <- svyby(~water_treat_any, by=~country:year:wealth_quintile, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.wealth.asia <- prev.later_hwt.wealth.asia %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.wealth.asia <- reshape(prev.later_hwt.wealth.asia, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.wealth.asia, file = "prev.later_hwt.wealth.asia.xlsx", borders = "columns")
+
+# wealth | Rest 
+design.latertime_hwt.rest <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=rest, nest = T)
+prev.later_hwt.wealth.rest <- svyby(~water_treat_any, by=~country:year:wealth_quintile, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.wealth.rest <- prev.later_hwt.wealth.rest %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.wealth.rest <- reshape(prev.later_hwt.wealth.rest, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.wealth.rest, file = "prev.later_hwt.wealth.rest.xlsx", borders = "columns")
+
+prev.later_hwt.wealth <- bind_rows(prev_later_hwt_wealth_africa, prev.later_hwt.wealth.asia, prev.later_hwt.wealth.rest)
+write.xlsx(prev.later_hwt.wealth, file = "prev.later_hwt.wealth.xlsx", borders = "columns")
+
+# education | Africa
+prev.later_hwt.edu.africa <- svyby(~water_treat_any, by=~country:year:educat, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.edu.africa <- prev.later_hwt.edu.africa %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.edu.africa <- reshape(prev.later_hwt.edu.africa, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.edu.africa, file = "prev.later_hwt.edu.africa.xlsx", borders = "columns")
+
+# education | Asia
+prev.later_hwt.edu.asia <- svyby(~water_treat_any, by=~country:year:educat, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.edu.asia <- prev.later_hwt.edu.asia %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.edu.asia <- reshape(prev.later_hwt.edu.asia, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.edu.asia, file = "prev.later_hwt.edu.asia.xlsx", borders = "columns")
+
+# education | rest
+prev.later_hwt.edu.rest <- svyby(~water_treat_any, by=~country:year:educat, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.edu.rest <- prev.later_hwt.edu.rest %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.edu.rest <- reshape(prev.later_hwt.edu.rest, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.edu.rest, file = "prev.later_hwt.edu.rest.xlsx", borders = "columns")
+
+#append
+prev.later_hwt.edu <- bind_rows(prev_later_hwt_edu_africa, prev.later_hwt.edu.asia, prev.later_hwt.edu.rest)
+write.xlsx(prev.later_hwt.edu, file = "prev.later_hwt.edu.xlsx", borders = "columns")
+
+# urban | Africa
+prev.later_hwt.urban.africa <- svyby(~water_treat_any, by=~country:year:urban, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.urban.africa <- prev.later_hwt.urban.africa %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.urban.africa <- reshape(prev.later_hwt.urban.africa, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.urban.africa, file = "prev.later_hwt.urban.africa.xlsx", borders = "columns")
+
+# urban | Asia
+prev.later_hwt.urban.asia <- svyby(~water_treat_any, by=~country:year:urban, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.urban.asia <- prev.later_hwt.urban.asia %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.urban.asia <- reshape(prev.later_hwt.urban.asia, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.urban.asia, file = "prev.later_hwt.urban.asia.xlsx", borders = "columns")
+
+# urban | rest
+prev.later_hwt.urban.rest <- svyby(~water_treat_any, by=~country:year:urban, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwt.urban.rest <- prev.later_hwt.urban.rest %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwt.urban.rest <- reshape(prev.later_hwt.urban.rest, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwt.urban.rest, file = "prev.later_hwt.urban.rest.xlsx", borders = "columns")
+
+#append
+prev.later_hwt.urban <- bind_rows(prev_later_hwt_urban_africa, prev.later_hwt.urban.asia, prev.later_hwt.urban.rest)
+write.xlsx(prev.later_hwt.urban, file = "prev.later_hwt.urban.xlsx", borders = "columns")
+
+### HWT appropriate
+# wealth | Africa
+prev.later_hwtappr.wealth.africa <- svyby(~water_treat_appr, by=~country:year:wealth_quintile, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.wealth.africa <- prev.later_hwtappr.wealth.africa %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.wealth.africa <- reshape(prev.later_hwtappr.wealth.africa, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwtappr.wealth.africa, file = "prev.later_hwtappr.wealth.africa.xlsx", borders = "columns")
+
+# wealth | Asia
+prev.later_hwtappr.wealth.asia <- svyby(~water_treat_appr, by=~country:year:wealth_quintile, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.wealth.asia <- prev.later_hwtappr.wealth.asia %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.wealth.asia <- reshape(prev.later_hwtappr.wealth.asia, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.wealth.asia, file = "prev.later_hwtappr.wealth.asia.xlsx", borders = "columns")
+
+# wealth | rest
+prev.later_hwtappr.wealth.rest <- svyby(~water_treat_appr, by=~country:year:wealth_quintile, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.wealth.rest <- prev.later_hwtappr.wealth.rest %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.wealth.rest <- reshape(prev.later_hwtappr.wealth.rest, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.wealth.rest, file = "prev.later_hwtappr.wealth.rest.xlsx", borders = "columns")
+
+#append
+prev.later_hwtappr.wealth <- bind_rows(prev_later_hwtappr_edu_africa, prev.later_hwtappr.wealth.asia, prev.later_hwtappr.wealth.rest)
+write.xlsx(prev.later_hwtappr.wealth, file = "prev.later_hwtappr.wealth.xlsx", borders = "columns")
+
+# education | Africa
+prev.later_hwtappr.edu.africa <- svyby(~water_treat_appr, by=~country:year:educat, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.edu.africa <- prev.later_hwtappr.edu.africa %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.edu.africa <- reshape(prev.later_hwtappr.edu.africa, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwtappr.edu.africa, file = "prev.later_hwtappr.edu.africa.xlsx", borders = "columns")
+
+# education | Asia
+prev.later_hwtappr.edu.asia <- svyby(~water_treat_appr, by=~country:year:educat, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.edu.asia <- prev.later_hwtappr.edu.asia %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.edu.asia <- reshape(prev.later_hwtappr.edu.asia, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.edu.asia, file = "prev.later_hwtappr.edu.asia.xlsx", borders = "columns")
+
+# education | rest
+prev.later_hwtappr.edu.rest <- svyby(~water_treat_appr, by=~country:year:educat, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.edu.rest <- prev.later_hwtappr.edu.rest %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.edu.rest <- reshape(prev.later_hwtappr.edu.rest, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.edu.rest, file = "prev.later_hwtappr.edu.rest.xlsx", borders = "columns")
+
+#append
+prev.later_hwtappr.edu <- bind_rows(prev_later_hwtappr_edu_africa, prev.later_hwtappr.edu.asia, prev.later_hwtappr.edu.rest)
+write.xlsx(prev.later_hwtappr.edu, file = "prev.later_hwtappr.edu.xlsx", borders = "columns")
+
+# urban | Africa
+prev.later_hwtappr.urban.africa <- svyby(~water_treat_appr, by=~country:year:urban, design=design.latertime_hwt.africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.urban.africa <- prev.later_hwtappr.urban.africa %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.urban.africa <- reshape(prev.later_hwtappr.urban.africa, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+
+write.xlsx(prev.later_hwtappr.urban.africa, file = "prev.later_hwtappr.urban.africa.xlsx", borders = "columns")
+
+# urban | Asia hier
+prev.later_hwtappr.urban.asia <- svyby(~water_treat_appr, by=~country:year:urban, design=design.latertime_hwt.asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.urban.asia <- prev.later_hwtappr.urban.asia %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.urban.asia <- reshape(prev.later_hwtappr.urban.asia, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.urban.asia, file = "prev.later_hwtappr.urban.asia.xlsx", borders = "columns")
+
+# urban | rest
+prev.later_hwtappr.urban.rest <- svyby(~water_treat_appr, by=~country:year:urban, design=design.latertime_hwt.rest, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.later_hwtappr.urban.rest <- prev.later_hwtappr.urban.rest %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.later_hwtappr.urban.rest <- reshape(prev.later_hwtappr.urban.rest, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.later_hwtappr.urban.rest, file = "prev.later_hwtappr.urban.rest.xlsx", borders = "columns")
+
+#append
+prev.later_hwtappr.urban <- bind_rows(prev_later_hwtappr_urban_africa, prev.later_hwtappr.urban.asia, prev.later_hwtappr.urban.rest)
+write.xlsx(prev.later_hwtappr.urban, file = "prev.later_hwtappr.urban.xlsx", borders = "columns")
+
+### merge concentration index prevalence tables with ci tables
+
+### merge with CI index tables
+# hwt | wealth
+prev_later_hwt_wealth <- read_excel("~/prev.later_hwt.wealth.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.late.wealth.xlsx")
+
+later_hwt_ci_wealth <- prev_later_hwt_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(later_hwt_ci_wealth, file = "later_hwt_ci_wealth.xlsx", borders = "columns")
+
+# hwt | edu
+prev_later_hwt_edu <- read_excel("~/prev.later_hwt.edu.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.late.edu.xlsx")
+
+later_hwt_ci_edu <- prev_later_hwt_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(later_hwt_ci_edu, file = "later_hwt_ci_edu.xlsx", borders = "columns")
+
+# hwt | urban
+prev_later_hwt_urban <- read_excel("~/prev.later_hwt.urban.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.late.urban.xlsx")
+
+later_hwt_ci_urban <- prev_later_hwt_urban %>% 
+  select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(later_hwt_ci_urban, file = "later_hwt_ci_urban.xlsx", borders = "columns")
+
+# hwtappr | wealth
+prev_later_hwtappr_wealth <- read_excel("~/prev.later_hwtappr.wealth.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.late.wealth.xlsx")
+
+later_hwtappr_ci_wealth <- prev_later_hwtappr_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(later_hwtappr_ci_wealth, file = "later_hwtappr_ci_wealth.xlsx", borders = "columns")
+
+# hwtappr | edu
+prev_later_hwtappr_edu <- read_excel("~/prev.later_hwtappr.edu.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.late.edu.xlsx")
+
+later_hwtappr_ci_edu <- prev_later_hwtappr_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(later_hwtappr_ci_edu, file = "later_hwtappr_ci_edu.xlsx", borders = "columns")
+
+# hwtappr | urban
+prev_later_hwtappr_urban <- read_excel("~/prev.later_hwtappr.urban.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.late.urban.xlsx")
+
+later_hwtappr_ci_urban <- prev_later_hwtappr_urban %>% 
+  select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(later_hwtappr_ci_urban, file = "later_hwtappr_ci_urban.xlsx", borders = "columns")
+
+
+```
+
+### 2000-2009
+
+```{r prepare and create survey design}
+
+# limit to country-year samples with at least 50 individuals and countries with at least two surveys within timeframe
+sample <- earlytime %>% 
+    group_by(country, year) %>%
+    summarise(total=n()) %>%
+    filter(total >50)  #%>%
+    #filter(n()>1)
+  sum(sample$total) #4039862
+  
+earlytime_hwt <- sample %>% left_join(earlytime)
+
+# get numbers of countries and n in sample
+nlevels(as.factor(earlytime_hwt$country))
+
+###limit to countries that have survey in both waves
+countries.hwt.early <- earlytime_hwt %>%
+  distinct(country) 
+
+#append
+countries.hwt <- merge(countries.hwt.late, countries.hwt.early) #merged has 67 countries, early 73 and late 91 countries
+
+# check sample size per region for flowchart  
+africa <- filter(earlytime_hwt, region=='Africa') #29
+america <- filter(earlytime_hwt, region=='The Americas') #11
+asia <- filter(earlytime_hwt, region=='South-East Asia') #5 
+medit <- filter(earlytime_hwt, region=='Eastern Mediteranean') #6
+europe <- filter(earlytime_hwt, region=='Europe') #17
+pacific <- filter(earlytime_hwt, region=='Western Pacific') #5
+
+# check sample size per income group 
+low <- filter(earlytime_hwt, income_group=='Low-income economies') 
+low_middle <- filter(earlytime_hwt, income_group=='Lower-middle-income economies')
+upper_middle <- filter(earlytime_hwt, income_group=='Upper-middle-income economies') 
+
+earlytime_hwt <- earlytime_hwt %>%
+  mutate(country_year = paste(country, year, sep = "-"))
+
+```
+
+```{r HWT any, by region; by income group}
+
+# Africa
+earlytime_hwt_africa <- filter(earlytime_hwt, region=="Africa")
+design.earlytime_hwt_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_africa, nest = T)
+prev.earlytime_hwt_africa <- svyby(~water_treat_any, by=~region, design=design.earlytime_hwt_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+earlytime_hwt_medit <- filter(earlytime_hwt, region=="Eastern Mediteranean")
+design.earlytime_hwt_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_medit, nest = T)
+prev.earlytime_hwt_medit <- svyby(~water_treat_any, by=~region, design=design.earlytime_hwt_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+earlytime_hwt_europe <- filter(earlytime_hwt, region=="Europe" | region=="Western Pacific")
+design.earlytime_hwt_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_europe, nest = T)
+prev.earlytime_hwt_europe <- svyby(~water_treat_any, by=~region, design=design.earlytime_hwt_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+earlytime_hwt_america <- filter(earlytime_hwt, region=="The Americas")
+design.earlytime_hwt_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_america, nest = T)
+prev.earlytime_hwt_america <- svyby(~water_treat_any, by=~region, design=design.earlytime_hwt_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+earlytime_hwt_asia <- filter(earlytime_hwt, region=="South-East Asia")
+design.earlytime_hwt_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_asia, nest = T)
+prev.earlytime_hwt_asia <- svyby(~water_treat_any, by=~region, design=design.earlytime_hwt_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwt <- bind_rows(prev.earlytime_hwt_africa, prev.earlytime_hwt_medit, prev.earlytime_hwt_europe, prev.earlytime_hwt_america, prev.earlytime_hwt_asia)
+
+# bring into decent format and save as excel
+prev.earlytime_hwt <- prev.earlytime_hwt %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwt, file = "prev.earlytime_hwt.xlsx", borders = "columns")
+
+### INCOME GROUP
+
+# Upper Middle
+earlytime_hwt.income_upperm <- filter(earlytime_hwt, income_group=="Upper-middle-income economies")
+design.earlytime_hwt.income_upperm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt.income_upperm, nest = T)
+prev.earlytime_hwt.income_upperm <- svyby(~water_treat_any, by=~income_group, design=design.earlytime_hwt.income_upperm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low Middle
+earlytime_hwt.income_lowm <- filter(earlytime_hwt, income_group=="Lower-middle-income economies")
+design.earlytime_hwt.income_lowm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt.income_lowm, nest = T)
+prev.earlytime_hwt.income_lowm <- svyby(~water_treat_any, by=~income_group, design=design.earlytime_hwt.income_lowm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low
+earlytime_hwt.income_low <- filter(earlytime_hwt, income_group=="Low-income economies")
+design.earlytime_hwt.income_low <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt.income_low, nest = T)
+prev.earlytime_hwt.income_low <- svyby(~water_treat_any, by=~income_group, design=design.earlytime_hwt.income_low, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwt.income <- bind_rows(prev.earlytime_hwt.income_upperm, prev.earlytime_hwt.income_lowm, prev.earlytime_hwt.income_low)
+
+# bring into decent format and save as excel
+prev.earlytime_hwt.income <- prev.earlytime_hwt.income %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwt.income, file = "prev.earlytime_hwt.income.xlsx", borders = "columns")
+
+```
+
+```{r HWT adequate, by region; by income group}
+
+# Africa
+earlytime_hwtappr_africa <- filter(earlytime_hwt, region=="Africa")
+design.earlytime_hwtappr_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_africa, nest = T)
+prev.earlytime_hwtappr_africa <- svyby(~water_treat_appr, by=~region, design=design.earlytime_hwtappr_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+earlytime_hwtappr_medit <- filter(earlytime_hwt, region=="Eastern Mediteranean")
+design.earlytime_hwtappr_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_medit, nest = T)
+prev.earlytime_hwtappr_medit <- svyby(~water_treat_appr, by=~region, design=design.earlytime_hwtappr_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+earlytime_hwtappr_europe <- filter(earlytime_hwt, region=="Europe" | region=="Western Pacific")
+design.earlytime_hwtappr_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_europe, nest = T)
+prev.earlytime_hwtappr_europe <- svyby(~water_treat_appr, by=~region, design=design.earlytime_hwtappr_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+earlytime_hwtappr_america <- filter(earlytime_hwt, region=="The Americas")
+design.earlytime_hwtappr_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_america, nest = T)
+prev.earlytime_hwtappr_america <- svyby(~water_treat_appr, by=~region, design=design.earlytime_hwtappr_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+earlytime_hwtappr_asia <- filter(earlytime_hwt, region=="South-East Asia")
+design.earlytime_hwtappr_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_asia, nest = T)
+prev.earlytime_hwtappr_asia <- svyby(~water_treat_appr, by=~region, design=design.earlytime_hwtappr_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwtappr <- bind_rows(prev.earlytime_hwtappr_africa, prev.earlytime_hwtappr_medit, prev.earlytime_hwtappr_europe, prev.earlytime_hwtappr_america, prev.earlytime_hwtappr_asia)
+
+# bring into decent format and save as excel
+prev.earlytime_hwtappr <- prev.earlytime_hwtappr %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(region, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwtappr, file = "prev.earlytime_hwtappr.xlsx", borders = "columns")
+
+### INCOME GROUP
+
+# Upper Middle
+earlytime_hwtappr.income_upperm <- filter(earlytime_hwt, income_group=="Upper-middle-income economies")
+design.earlytime_hwtappr.income_upperm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr.income_upperm, nest = T)
+prev.earlytime_hwtappr.income_upperm <- svyby(~water_treat_appr, by=~income_group, design=design.earlytime_hwtappr.income_upperm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low Middle
+earlytime_hwtappr.income_lowm <- filter(earlytime_hwt, income_group=="Lower-middle-income economies")
+design.earlytime_hwtappr.income_lowm <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr.income_lowm, nest = T)
+prev.earlytime_hwtappr.income_lowm <- svyby(~water_treat_appr, by=~income_group, design=design.earlytime_hwtappr.income_lowm, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Low
+earlytime_hwtappr.income_low <- filter(earlytime_hwt, income_group=="Low-income economies")
+design.earlytime_hwtappr.income_low <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr.income_low, nest = T)
+prev.earlytime_hwtappr.income_low <- svyby(~water_treat_appr, by=~income_group, design=design.earlytime_hwtappr.income_low, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwtappr.income <- bind_rows(prev.earlytime_hwtappr.income_upperm, prev.earlytime_hwtappr.income_lowm, prev.earlytime_hwtappr.income_low)
+
+# bring into decent format and save as excel
+prev.earlytime_hwtappr.income <- prev.earlytime_hwtappr.income %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(income_group, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwtappr.income, file = "prev.earlytime_hwtappr.income.xlsx", borders = "columns")
+
+
+
+```
+
+```{r global prevalence}
+
+#load in global survey design
+design.earlytime_hwt.global <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt, nest = T)
+
+# HWT
+svymean(~water_treat_any, design.earlytime_hwt.global, deff=TRUE)  
+confint(svymean(~water_treat_any, design.earlytime_hwt.global, level = 0.95))
+
+# appropriate HWT
+svymean(~water_treat_appr, design.earlytime_hwt.global, deff=TRUE)  
+confint(svymean(~water_treat_appr, design.earlytime_hwt.global, level = 0.95))
+
+```
+
+```{r Figure 2: Global, regional and income group prevalence for both time periods}
+
+### HWT
+prev_figure2 <- read_excel("prev_figure2.hwt.xlsx") #prepare this figure in excel, easier than in R directly. File can be found in folder "Excel files HWT"
+
+# create and order factor levels
+prev_figure2$level <- prev_figure2$level %>% factor(c("Global", "Africa", "Eastern Mediterranean", "Europe", "South-East Asia", "The Americas", "Western Pacific", "Low-income", "Lower-middle-income", "Upper-middle-income"))
+prev_figure2$level <- factor(prev_figure2$level, levels = rev(levels(prev_figure2$level)))
+
+prev_figure2$years <- prev_figure2$years %>% factor(c("2010-2021", "2000-2009"))
+prev_figure2$years <- factor(prev_figure2$years, levels = rev(levels(prev_figure2$years)))
+
+#plot
+hwt.fig2 <- prev_figure2 %>% 
+  ggplot(aes(x = level, y = mean, fill = years)) +
+  geom_bar(stat = "identity", alpha = 0.9, position = position_dodge(width = 0.5), width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.5), show.legend = FALSE) +
+  labs(
+    title = paste0("Household water treatment prevalence"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  theme_bw()+
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 35)),
+    axis.title.y = element_text(margin = margin(r = 35)),
+    strip.text.x = element_text(size = 35, face = "bold"),
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 35),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_fill_manual(values = c("#FDBB84", "#990000")) +
+  coord_flip() +
+  guides(fill = guide_legend(reverse = TRUE))
+
+print(hwt.fig2)
+ #coord_fixed(5/100) 
+
+ggsave("hwt.fig2.png", height = 12, width = 25) 
+ggsave("hwt.fig2.pdf", height = 12, width = 25)
+
+### HWT APPROPRIATE
+prev_figure2 <- read_excel("prev_figure2.hwt.appr.xlsx") #prepare this figure in excel, easier than in R directly. File can be found in folder "Excel files HWT"
+
+# create and order factor levels
+prev_figure2$level <- prev_figure2$level %>% factor(c("Global", "Africa", "Eastern Mediterranean", "Europe", "South-East Asia", "The Americas", "Western Pacific", "Low-income", "Lower-middle-income", "Upper-middle-income"))
+prev_figure2$level <- factor(prev_figure2$level, levels = rev(levels(prev_figure2$level)))
+
+prev_figure2$years <- prev_figure2$years %>% factor(c("2010-2021", "2000-2009"))
+prev_figure2$years <- factor(prev_figure2$years, levels = rev(levels(prev_figure2$years)))
+
+#plot                                                    
+hwtappr.fig2 <- prev_figure2 %>% 
+  ggplot(aes(x = level, y = mean, fill = years)) +
+  geom_bar(stat = "identity", alpha = 0.9, position = position_dodge(width = 0.5), width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.5), show.legend = FALSE) +
+  labs(
+    title = paste0("Household water treatment prevalence (appropriate methods)"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  theme_bw()+
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 35)),
+    axis.title.y = element_text(margin = margin(r = 35)),
+    strip.text.x = element_text(size = 35, face = "bold"),
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 35),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_fill_manual(values = c("#FDBB84", "#990000")) +
+  coord_flip() +
+  guides(fill = guide_legend(reverse = TRUE))
+
+print(hwtappr.fig2)
+ #coord_fixed(5/100) 
+
+ggsave("hwtappr.fig2.png", height = 12, width = 25) 
+ggsave("hwtappr.fig2.pdf", height = 12, width = 25)
+          
+
+```
+
+```{r country level prevalence for each outcome}
+
+### HWT
+
+# Africa
+earlytime_hwt_africa <- filter(earlytime_hwt, region=="Africa")
+design.earlytime_hwt_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_africa, nest = T)
+prev.earlytime_hwt_africa <- svyby(~water_treat_any, by=~country + year, design=design.earlytime_hwt_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+earlytime_hwt_medit <- filter(earlytime_hwt, region=="Eastern Mediteranean")
+design.earlytime_hwt_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_medit, nest = T)
+prev.earlytime_hwt_medit <- svyby(~water_treat_any, by=~country + year, design=design.earlytime_hwt_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+earlytime_hwt_europe <- filter(earlytime_hwt, region=="Europe" | region=="Western Pacific")
+design.earlytime_hwt_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_europe, nest = T)
+prev.earlytime_hwt_europe <- svyby(~water_treat_any, by=~country + year, design=design.earlytime_hwt_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+earlytime_hwt_america <- filter(earlytime_hwt, region=="The Americas")
+design.earlytime_hwt_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_america, nest = T)
+prev.earlytime_hwt_america <- svyby(~water_treat_any, by=~country + year, design=design.earlytime_hwt_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+earlytime_hwt_asia <- filter(earlytime_hwt, region=="South-East Asia")
+design.earlytime_hwt_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwt_asia, nest = T)
+prev.earlytime_hwt_asia <- svyby(~water_treat_any, by=~country + year, design=design.earlytime_hwt_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwt <- bind_rows(prev.earlytime_hwt_africa, prev.earlytime_hwt_medit, prev.earlytime_hwt_europe, prev.earlytime_hwt_america, prev.earlytime_hwt_asia)
+
+# bring into decent format and save as excel
+prev.earlytime_hwt <- prev.earlytime_hwt %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwt, file = "prev.earlytime.country_hwt.xlsx", borders = "columns")
+
+### HWT APPROPRIATE
+
+# Africa
+earlytime_hwtappr_africa <- filter(earlytime_hwt, region=="Africa")
+design.earlytime_hwtappr_africa <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_africa, nest = T)
+prev.earlytime_hwtappr_africa <- svyby(~water_treat_appr, by=~country + year, design=design.earlytime_hwtappr_africa, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+  
+# Eastern Mediteranean
+earlytime_hwtappr_medit <- filter(earlytime_hwt, region=="Eastern Mediteranean")
+design.earlytime_hwtappr_medit <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_medit, nest = T)
+prev.earlytime_hwtappr_medit <- svyby(~water_treat_appr, by=~country + year, design=design.earlytime_hwtappr_medit, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# Europe
+earlytime_hwtappr_europe <- filter(earlytime_hwt, region=="Europe" | region=="Western Pacific")
+design.earlytime_hwtappr_europe <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_europe, nest = T)
+prev.earlytime_hwtappr_europe <- svyby(~water_treat_appr, by=~country + year, design=design.earlytime_hwtappr_europe, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# The Americas
+earlytime_hwtappr_america <- filter(earlytime_hwt, region=="The Americas")
+design.earlytime_hwtappr_america <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_america, nest = T)
+prev.earlytime_hwtappr_america <- svyby(~water_treat_appr, by=~country + year, design=design.earlytime_hwtappr_america, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# South-East Asia
+earlytime_hwtappr_asia <- filter(earlytime_hwt, region=="South-East Asia")
+design.earlytime_hwtappr_asia <- svydesign(id=~psu+hh_id, strata=~stratum, weights=~scaled_weights, data=earlytime_hwtappr_asia, nest = T)
+prev.earlytime_hwtappr_asia <- svyby(~water_treat_appr, by=~country + year, design=design.earlytime_hwtappr_asia, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+#combine prevalences
+prev.earlytime_hwtappr <- bind_rows(prev.earlytime_hwtappr_africa, prev.earlytime_hwtappr_medit, prev.earlytime_hwtappr_europe, prev.earlytime_hwtappr_america, prev.earlytime_hwtappr_asia)
+
+# bring into decent format and save as excel
+prev.earlytime_hwtappr <- prev.earlytime_hwtappr %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+
+write.xlsx(prev.earlytime_hwtappr, file = "prev.earlytime.country_hwtappr.xlsx", borders = "columns")
+
+```
+
+```{r average annual rate of change (AARC), 2000-2009}
+
+### HWT any
+prev_water_treat_any <- read_excel("~/prev.country_hwt.xlsx") #I compiled this file manually in excel to include prevalences from both time periods. File can be found in folder "Excel files HWT"
+prev_water_treat_any <- prev_water_treat_any %>% 
+ filter(year > 1999 & year < 2010)
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev_water_treat_any <- prev_water_treat_any %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev_water_treat_any %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev_water_treat_any %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev_water_treat_any %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.hwt.early.csv")
+
+### HWT APPROPRIATE
+prev_water_treat_appr <- read_excel("~/prev.country_hwtappr.xlsx") #I compiled this file manually in excel to include prevalences from both time periods. File can be found in folder "Excel files HWT"
+prev_water_treat_appr <- prev_water_treat_appr %>% 
+ filter(year > 1999 & year < 2010)
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(timepoint_count = n()) %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(timepoint_count > 1)
+
+# add a new column indicating whether there are only two time points
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  mutate(timepoint_category = ifelse(timepoint_count == 2, "Two Time Points", "More than Two Time Points"))
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  select(-timepoint_count)
+
+# Calculate AARC for each year per country
+aarc_eachyear <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_yearly = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100)
+
+# Calculate overall AARC per country
+aarc_overall <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'More than Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc = ((w_mean / lag(w_mean))^(1 / (year - lag(year))) - 1) * 100) %>%
+  summarize(overall_aarc = mean(aarc, na.rm = TRUE))
+
+aarc_comb <- aarc_eachyear %>% 
+  left_join(aarc_overall) %>%
+  select(-timepoint_category)
+
+# rate of change for countries with only two timepoints
+aarc_2timepoints <- prev_water_treat_appr %>%
+  filter(timepoint_category == 'Two Time Points') %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(aarc_2years = ((w_mean - lag(w_mean)) / lag(w_mean)) * 100) %>%
+  select(-timepoint_category)
+
+aarc_final <- bind_rows(aarc_comb, aarc_2timepoints) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc)==T & is.na(aarc_2years)==F, aarc_2years, overall_aarc))
+
+write.csv(aarc_final, "~/aarc_final.hwtappr.early.csv")
+
+```
+
+#appendix
+```{r eFigure 1-4: country level figure}
+
+prev_water_treat_any <- read.csv("~/aarc_final.hwt.early.csv")#
+prev_water_treat_any <- prev_water_treat_any %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  left_join(regions)
+
+prev_water_treat_any <- prev_water_treat_any %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_water_treat_any <- prev_water_treat_any %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_water_treat_any$year <- factor(prev_water_treat_any$year, levels = unique(prev_water_treat_any$year))
+
+### ALL COUNTRIES
+prev_water_treat_any.fig.early.all  <- prev_water_treat_any %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("HWT prevalence, 2000-2009"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 1) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_water_treat_any.fig.early.all.png", height = 35, width = 40)
+
+### HWTW appropriate
+prev_water_treat_appr <- read.csv("~/aarc_final.hwtappr.early.csv")#
+prev_water_treat_appr <- prev_water_treat_appr %>% select(-X)
+regions <-read.csv("~/regions.csv")
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  left_join(regions)
+
+prev_water_treat_appr <- prev_water_treat_appr %>% 
+      mutate(region=ifelse(country=="Argentina", "The Americas", 
+                           ifelse(country=="Bangladesh", "South-East Asia",
+                                  ifelse(country=="Central African Republic", "Africa",
+                                         ifelse(country=="Chad", "Africa",
+                                                ifelse(country=="Dom.Rep.", "The Americas",
+                                                       ifelse(country=="Lao People's Democratic Republic", "Western Pacific",
+                                                              ifelse(country=="Macedonia", "Europe", 
+                                                                     ifelse(country=="Algeria", "Africa",
+                                                                            ifelse(country=="Guinea-Bissau", "Africa",
+                                                                                   ifelse(country=="Pakistan", "Eastern Mediteranean",region)))))))))))
+
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  arrange(year)
+
+prev_water_treat_appr <- prev_water_treat_appr %>%
+  group_by(country) %>%
+  mutate(overall_aarc = ifelse(is.na(overall_aarc), sum(overall_aarc, na.rm = TRUE), overall_aarc)) %>%
+  ungroup()
+
+prev_water_treat_appr$year <- factor(prev_water_treat_appr$year, levels = unique(prev_water_treat_appr$year))
+
+### ALL COUNTRIES
+prev_water_treat_appr.fig.early.all  <- prev_water_treat_appr %>%   
+ # filter(income_group == 'Low') %>% 
+  ggplot(aes(x = year, y = w_mean, fill = "aquamarine3")) +
+  geom_col(position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, position = position_dodge(width = 0.8),size = 1.5,  show.legend = FALSE) +
+  labs(
+    title = paste0("HWT appropriate method prevalence, 2000-2009"),
+    x = "",
+    y = "%",
+    fill = ""
+  ) + 
+  scale_fill_manual(values = "aquamarine3") +
+  theme_bw() +
+  theme(
+    text = element_text(family = "Times", size = 35, color = "black"),
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 30)),
+    axis.title.y = element_text(margin = margin(r = 30)),
+    strip.text.x = element_text(size = 35, face = "bold", hjust = 0, margin = margin(r = 45)),  # Adjust the margin for facet labels
+    title = element_text(size = 35, face = "bold"),
+    legend.text = element_text(size = 30),
+    strip.background = element_blank(),
+    panel.spacing = unit(2, "lines"),  # Adjust panel spacing
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 35, face = "bold"),
+    axis.text.y = element_text(size = 35, face = "bold"),
+    panel.border = element_blank(),  # Remove grey border around each country panel
+  ) + 
+  coord_flip() +
+  facet_wrap(~ country, scales = "free_y", ncol = 1) +
+  guides(fill = FALSE) +
+  geom_text(aes(label = paste0("AARC: ", round(overall_aarc, 2))),
+            x = Inf, y = Inf, hjust = 1, vjust = 1, size = 12)
+
+ggsave("prev_water_treat_appr.fig.early.all.png", height = 35, width = 40)
+
+```
+
+```{r eTable 12-15: AARC and country prevalence tables}
+
+### HWT 
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/aarc_final.hwt.early.csv")
+hwt_country_prev <- read_excel("~/hwt.country.prev.xlsx") #these were compiled manually in excel to fit the required format and available in the folder "Excel files HWT" 
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+hwt_country_prev.aarc.early <- hwt_country_prev %>%
+  filter(year > 1999 & year < 2010) %>%
+  arrange(country, desc(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Prevalence (95% CI)", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(hwt_country_prev.aarc.early, file = "hwt_country_prev.aarc.early.xlsx", borders = "columns")
+
+### HWT appr.
+
+# load in aarcs and country level table
+aarc_final <-read.csv("~/aarc_final.hwtappr.early.csv")
+hwt_country_prev <- read_excel("~/hwt.appr.country.prev.xlsx") #these were compiled manually in excel to fit the required format and available in the folder "Excel files HWT" 
+
+# only keep countries and overall aarc for merging
+aarc_final <- aarc_final %>%
+  distinct(country, year, overall_aarc) %>%
+  na.omit()
+
+# append both tables
+hwt.appr_country_prev.aarc.early <- hwt_country_prev %>%
+  filter(year > 1999 & year < 2010) %>%
+  arrange(country, desc(year)) %>%
+  left_join(aarc_final) %>%
+  select(country, year, "Prevalence (95% CI)", overall_aarc) %>%
+  mutate(overall_aarc = ifelse(duplicated(overall_aarc), NA, round(overall_aarc, 2)))
+
+write.xlsx(hwt.appr_country_prev.aarc.early, file = "hwt.appr_country_prev.aarc.early.xlsx", borders = "columns")
+
+```
+
+```{r eTables 22-51: concentration index tables}
+
+#concentrated prevalence for each country and year, by wealth, education and residence. Later add concentration index from STATA output for combined eTables 22-51
+
+### HWT any
+# wealth
+prev.early_hwt.wealth <- svyby(~water_treat_any, by=~country:year:wealth_quintile, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwt.wealth <- prev.early_hwt.wealth %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwt.wealth <- reshape(prev.early_hwt.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwt.wealth, file = "prev.early_hwt.wealth.xlsx", borders = "columns")
+
+# education
+prev.early_hwt.edu <- svyby(~water_treat_any, by=~country:year:educat, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwt.edu <- prev.early_hwt.edu %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwt.edu <- reshape(prev.early_hwt.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwt.edu, file = "prev.early_hwt.edu.xlsx", borders = "columns")
+
+# urban
+prev.early_hwt.urban <- svyby(~water_treat_any, by=~country:year:urban, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwt.urban <- prev.early_hwt.urban %>% 
+  mutate( w_mean = water_treat_any*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwt.urban <- reshape(prev.early_hwt.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwt.urban, file = "prev.early_hwt.urban.xlsx", borders = "columns")
+
+### HWT appropriat
+# wealth
+prev.early_hwtappr.wealth <- svyby(~water_treat_appr, by=~country:year:wealth_quintile, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwtappr.wealth <- prev.early_hwtappr.wealth %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, wealth_quintile, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwtappr.wealth <- reshape(prev.early_hwtappr.wealth, idvar = c("country", "year"), timevar = "wealth_quintile", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwtappr.wealth, file = "prev.early_hwtappr.wealth.xlsx", borders = "columns")
+
+# education
+prev.early_hwtappr.edu <- svyby(~water_treat_appr, by=~country:year:educat, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwtappr.edu <- prev.early_hwtappr.edu %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, educat, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwtappr.edu <- reshape(prev.early_hwtappr.edu, idvar = c("country", "year"), timevar = "educat", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwtappr.edu, file = "prev.early_hwtappr.edu.xlsx", borders = "columns")
+
+# urban
+prev.early_hwtappr.urban <- svyby(~water_treat_appr, by=~country:year:urban, design=design.earlytime_hwt.global, svyciprop, proportion=TRUE, prop_method="asin", vartype = "ci")
+
+# bring into decent format and save as excel
+prev.early_hwtappr.urban <- prev.early_hwtappr.urban %>% 
+  mutate( w_mean = water_treat_appr*100,
+          lower = ci_l*100,
+          upper = ci_u*100)  %>% 
+  select(country, year, urban, w_mean, lower, upper) %>%
+  mutate(Estimate_CI = paste(
+    round(w_mean, 1),
+    " (",
+    round(lower, 1),
+    " - ",
+    round(upper, 1),
+    ")",
+    sep = ""))
+prev.early_hwtappr.urban <- reshape(prev.early_hwtappr.urban, idvar = c("country", "year"), timevar = "urban", direction = "wide")%>%
+  arrange(country, desc(year))
+write.xlsx(prev.early_hwtappr.urban, file = "prev.early_hwtappr.urban.xlsx", borders = "columns")
+
+### merge with CI index tables
+# hwt | wealth
+prev_early_hwt_wealth <- read_excel("~/prev.early_hwt.wealth.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.early.wealth.xlsx")
+
+early_hwt_ci_wealth <- prev_early_hwt_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(early_hwt_ci_wealth, file = "early_hwt_ci_wealth.xlsx", borders = "columns")
+
+# hwt | edu
+prev_early_hwt_edu <- read_excel("~/prev.early_hwt.edu.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.early.edu.xlsx")
+
+early_hwt_ci_edu <- prev_early_hwt_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(early_hwt_ci_edu, file = "early_hwt_ci_edu.xlsx", borders = "columns")
+
+# hwt | urban
+prev_early_hwt_urban <- read_excel("~/prev.early_hwt.urban.xlsx")
+concentration_index_hwt <- read_excel("~/concentration.index.hwt.early.urban.xlsx")
+
+early_hwt_ci_urban <- prev_early_hwt_urban %>% 
+  select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwt)
+
+write.xlsx(early_hwt_ci_urban, file = "early_hwt_ci_urban.xlsx", borders = "columns")
+
+# hwtappr | wealth
+prev_early_hwtappr_wealth <- read_excel("~/prev.early_hwtappr.wealth.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.early.wealth.xlsx")
+
+early_hwtappr_ci_wealth <- prev_early_hwtappr_wealth %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(early_hwtappr_ci_wealth, file = "early_hwtappr_ci_wealth.xlsx", borders = "columns")
+
+# hwtappr | edu
+prev_early_hwtappr_edu <- read_excel("~/prev.early_hwtappr.edu.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.early.edu.xlsx")
+
+early_hwtappr_ci_edu <- prev_early_hwtappr_edu %>% 
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(early_hwtappr_ci_edu, file = "early_hwtappr_ci_edu.xlsx", borders = "columns")
+
+# hwtappr | urban
+prev_early_hwtappr_urban <- read_excel("~/prev.early_hwtappr.urban.xlsx")
+concentration_index_hwtappr <- read_excel("~/concentration.index.apprhwt.early.urban.xlsx")
+
+early_hwtappr_ci_urban <- prev_early_hwtappr_urban %>% 
+  select(country, year, Estimate_CI.0, Estimate_CI.1) %>%
+  mutate(year = as.numeric(year)) %>%
+  left_join(concentration_index_hwtappr)
+
+write.xlsx(early_hwtappr_ci_urban, file = "early_hwtappr_ci_urban.xlsx", borders = "columns")
+
+
+```
+
+
