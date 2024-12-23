@@ -5,26 +5,6 @@ This study includes individual-level data from 339 surveys, which are all public
 All analysis except the concentration index calculations were done in R version 4.0.5. The concentration index was calculated with the _conindex_ function in STATA 18.0
 The analysis is done with two datasets (ORT, HWT) for five outcomes, three from the ORT dataset and two from the HWT dataset. All analysis were done separately for two time periods, 2000-2009 and 2010-2021
 
-All datasets and code can be found in folder "data and code"
-
-Use ORS analysis_Revision 1_public.Rmd for the ORS dataset (subset_orsdata.csv) (R)
-
-Use HWT analysis_Revision 1_public.Rmd for the HWT dataset (subset_hwtdata.csv) (R)
-
-Use concentration index.do for the concentration index (STATA)
-
-Use the following additional files:
-*HWT
--prev.country_hwt.xlsx and prev.country_hwtappr.xlsx for AARC and to create Figure 3 (world map)
--regions.csv to conduct eFigure 1-4
--hwt.country.prev.xlxs and hwt.appr.country.prev.xlsx for eTable 12-15
--prev_figure2.hwt and prev_figure2.hwt.appr for Figure 2
-
-*ORT
--prev.country_ors.xslx, prev.country_feed.xslx and prev.country_ortfeed.xslx for AARCs and eTable 16-21
--regions.csv to conduct eFigure 5-10
--prev_figure2.ors.xslx, prev_figure2.feed.xslx and prev_figure2.orsfeed.xslx for Figure 2
-
 ### Example Code
 ```R
 # Example function to perform basic data analysis
